@@ -5,6 +5,8 @@ class GlobalTE:
     def __init__(self):
         self.transfer_engine = None
         self._initialization_attempted = False
+        self.local_hostname: str | None = None
+        self.local_device_name: str | None = None
         self.is_register_buffer: bool = False
         self.registered_buffers: list[tuple[int, int]] = []
         self.transfer_engine_lock = threading.Lock()
@@ -42,6 +44,8 @@ class GlobalTE:
                             f"TransferEngine initialization failed with ret_value: {ret_value}. "
                             "Restart the process before retrying."
                         )
+                    self.local_hostname = hostname
+                    self.local_device_name = device_name
                     self.transfer_engine = engine
         return self.transfer_engine
 

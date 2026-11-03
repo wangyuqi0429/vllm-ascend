@@ -20,6 +20,8 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
 
 from __future__ import annotations
 
+import contextlib
+
 from dataclasses import dataclass
 from typing import Any, NamedTuple, TypeVar, cast
 
@@ -657,6 +659,9 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
     ) -> torch.Tensor:
         attn_metadata = cast(AscendSFAOffloadMetadata, attn_metadata)
         self._current_layer_name = layer_name
+        manager = get_sparse_kv_offload_manager()
+        if getattr(manager, "is_mooncake", False) and manager._closed:
+            raise RuntimeError("Mooncake sparse pool is closed")
         self._copy_sfa_metadata = attn_metadata
         if self.use_fused_copy_sfa and attn_metadata is not None and not attn_metadata.fused_copy_sfa_enabled:
             # Attention metadata preparation invalidates residency history
@@ -799,30 +804,107 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             logical_lens = metadata.copy_sfa_logical_lens
             topk_misses = owner.lim_topk_misses[:tokens]
             misses = owner.lim_misses[:count]
+        metrics = getattr(manager, "mooncake_metrics", None)
+        if (
+            metrics is not None and metrics.enabled and getattr(manager, "mooncake_device_execution", False)
+            and manager.sparse_kv_offload_config.mooncake_execution_mode == "eager"
+            and not torch.npu.is_current_stream_capturing()
+        ):
+            manager._mooncake_cache_metric_refs[layer_id] = (
+                topk_misses, cache_tokens, logical_lens, metadata.copy_sfa_query_ends,
+            )
+        if getattr(manager, "is_mooncake", False) and not getattr(manager, "mooncake_fused_copy", False):
+            if self._in_graph_runtime():
+                raise RuntimeError("Mooncake eager attention cannot execute inside capture/replay")
+            manager.reload_mooncake_lim(
+                layer_name,
+                owner.lim_miss_src[:count],
+                owner.lim_miss_dst[:count],
+                misses,
+                metadata.copy_sfa_source_block_table,
+                metadata.copy_sfa_hbm_block_table,
+            )
+            # LIM produces cache-local destinations. Ordinary SFA consumes the
+            # identical selected set plus the current circular tail; dense
+            # short rows consume their full visible prefix instead of Top-K.
+            cache_counts = cache_tokens.cpu().tolist()
+            logical = logical_lens.cpu().tolist()
+            query_ends = metadata.copy_sfa_query_ends.cpu().tolist()
+            destinations = owner.lim_topk_dst[:tokens, 0].cpu().tolist()
+            selected_rows = [[] for _ in range(tokens)]
+            begin = 0
+            for request, end in enumerate(query_ends):
+                if end < begin or end > tokens or end - begin > 1:
+                    raise ValueError("Mooncake eager decode requires monotonic single-token query extents")
+                cache_count, logical_length = cache_counts[request], logical[request]
+                if cache_count < 0 or logical_length < cache_count:
+                    raise ValueError("Mooncake SFA cache/logical lengths are inconsistent")
+                for query_row in range(begin, end):
+                    if query_row >= tokens:
+                        raise ValueError("Mooncake SFA query extents exceed active tokens")
+                    if cache_counts[request] == 0:
+                        selected_rows[query_row] = list(range(logical[request]))
+                    else:
+                        if any(slot >= cache_count for slot in destinations[query_row]):
+                            raise ValueError("LIM selected a destination beyond its hot prefix")
+                        selected_rows[query_row] = [slot for slot in destinations[query_row] if slot >= 0]
+                        selected_rows[query_row].extend(range(cache_counts[request], logical[request]))
+                begin = end
+            if begin != tokens:
+                raise ValueError("Mooncake query extents do not cover active decode tokens")
+            if metrics is not None and metrics.enabled:
+                selected_count = sum(len(row) for row in selected_rows)
+                miss_count = int(topk_misses.sum().item())
+                metrics.record_cache(max(selected_count - miss_count, 0), miss_count)
+            width = max((len(row) for row in selected_rows), default=0)
+            selected = torch.full((tokens, 1, max(width, 1)), -1, dtype=torch.int32, device=query.device)
+            for row, values in enumerate(selected_rows):
+                if values:
+                    selected[row, 0, : len(values)] = torch.tensor(values, dtype=torch.int32, device=query.device)
+            result = torch.ops._C_ascend.npu_sparse_flash_attention(
+                query=query[:tokens].contiguous(),
+                key=hbm_k,
+                value=hbm_k,
+                sparse_indices=selected,
+                scale_value=float(self.scale),
+                sparse_block_size=1,
+                block_table=metadata.copy_sfa_hbm_block_table,
+                actual_seq_lengths_query=metadata.copy_sfa_query_ends,
+                actual_seq_lengths_kv=logical_lens,
+                query_rope=query_rope[:tokens].contiguous(),
+                key_rope=hbm_v,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+            return result[0] if isinstance(result, tuple) else result
         heads = query.shape[1]
         q, qr = prepare_copy_sfa_queries(query[:tokens], query_rope[:tokens])
         out = torch.empty_like(q)
-        torch.ops._C_ascend.npu_fused_scatter_copy_sparse_flash_attention(
-            qr,
-            q,
-            metadata.copy_sfa_query_ends,
-            logical_lens,
-            cache_tokens,
-            owner.lim_topk_dst[:tokens],
-            owner.lim_topk_src[:tokens],
-            topk_misses,
-            owner.lim_miss_src[:count],
-            owner.lim_miss_dst[:count],
-            misses,
-            metadata.copy_sfa_hbm_block_table,
-            metadata.copy_sfa_source_block_table,
-            hbm_v,
-            hbm_k,
-            host_v,
-            host_k,
-            float(self.scale),
-            out,
-        )
+        with manager.mooncake_metrics.measure("fused_copy_attention", device=True) if getattr(manager, "is_mooncake", False) else contextlib.nullcontext():
+            torch.ops._C_ascend.npu_fused_scatter_copy_sparse_flash_attention(
+                qr,
+                q,
+                metadata.copy_sfa_query_ends,
+                logical_lens,
+                cache_tokens,
+                owner.lim_topk_dst[:tokens],
+                owner.lim_topk_src[:tokens],
+                topk_misses,
+                owner.lim_miss_src[:count],
+                owner.lim_miss_dst[:count],
+                misses,
+                metadata.copy_sfa_hbm_block_table,
+                metadata.copy_sfa_source_block_table,
+                hbm_v,
+                hbm_k,
+                host_v,
+                host_k,
+                float(self.scale),
+                out,
+            )
         return out[:, :heads].contiguous()
 
     def _compute_kv_only(

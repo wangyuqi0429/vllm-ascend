@@ -61,6 +61,11 @@ from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import 
     MEMFABRIC_ROLE_PREFILL,
     global_memfabric_te,
 )
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_sparse_transfer import (
+    BACKEND_MOONCAKE,
+    MooncakeCompletionUnknown,
+    MooncakeSparseTransfer,
+)
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     collect_storage_merged_register_regions,
     get_transfer_timeout_value,
@@ -144,6 +149,8 @@ class SFAPDRD2HConsumerWorker:
 
         self.offload_manager = None
         self._cpu_blocks_by_req: dict[str, int] = {}
+        self._mooncake_pending_recv: set[str] = set()
+        self._mooncake_completed_recv: set[str] = set()
         self._invalid_block_ids: set[int] = set()
         # external_req_id -> internal_req_id, so get_finished can map the recv
         # thread's done_recving (keyed by external id from P's DONE signal) back
@@ -206,6 +213,14 @@ class SFAPDRD2HConsumerWorker:
     def _ensure_engine(self):
         if self.engine is None:
             backend = _resolve_kv_transfer_backend(self.vllm_config)
+            if backend == BACKEND_MOONCAKE:
+                self.engine = MooncakeSparseTransfer(
+                    self.side_channel_host, str(torch.npu.current_device()),
+                    metrics_enabled=(self.vllm_config.additional_config or {}).get(
+                        "sparse_kv_offload_config", {}
+                    ).get("mooncake_metrics", False),
+                )
+                return
             if backend != BACKEND_MEMFABRIC:
                 raise RuntimeError(
                     "SfaRemoteD2HConnector D side supports MemFabric pull only (set transfer_backend=memfabric)."
@@ -224,9 +239,8 @@ class SFAPDRD2HConsumerWorker:
     # ------------------------------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Bind MemFabric destinations owned by SparseKVOffloadManager."""
-        assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
-            "SfaRemoteD2HConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
-        )
+        if _resolve_kv_transfer_backend(self.vllm_config) not in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE):
+            raise ValueError("SFA PD transfer_backend must be memfabric or mooncake")
         self.offload_manager = get_sparse_kv_offload_manager()
         if not hasattr(self.offload_manager, "offload_layer_names"):
             raise RuntimeError(
@@ -244,6 +258,8 @@ class SFAPDRD2HConsumerWorker:
                 main_ids = list(getattr(req, "main_block_ids", []) or [])
                 indexer_ids = list(getattr(req, "indexer_block_ids", []) or [])
                 self._dest_blocks_by_req[ext_id] = (main_ids, indexer_ids)
+                if isinstance(self.engine, MooncakeSparseTransfer) and req_id not in self._mooncake_completed_recv:
+                    self._mooncake_pending_recv.add(req_id)
                 self._cpu_blocks_by_req[req_id] = len(main_ids)
                 descriptor = getattr(req, "dspark_context_descriptor", None)
                 if descriptor is not None:
@@ -300,6 +316,8 @@ class SFAPDRD2HConsumerWorker:
                 self._dspark_pending_recv.discard(req_id)
                 self._deferred_finished_req_ids.discard(req_id)
             self._cpu_blocks_by_req.pop(req_id, None)
+            self._mooncake_pending_recv.discard(req_id)
+            self._mooncake_completed_recv.discard(req_id)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
             getattr(self, "_dspark_draft_blocks_by_req", {}).pop(ext_id, None)
@@ -329,7 +347,19 @@ class SFAPDRD2HConsumerWorker:
         return [status for status in gathered if status is not None]
 
     def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
+        if isinstance(self.engine, MooncakeSparseTransfer):
+            unknown = getattr(self._mf_read_thread, "completion_unknown_error", None)
+            statuses = [None] * self.tp_size
+            if self.tp_size > 1:
+                torch.distributed.all_gather_object(
+                    statuses, str(unknown) if unknown is not None else None, group=get_tp_group().cpu_group
+                )
+            else:
+                statuses[0] = str(unknown) if unknown is not None else None
+            if any(status is not None for status in statuses):
+                raise MooncakeCompletionUnknown(f"Sparse PD completion is unknown on a TP rank: {statuses}")
         done_recving: set[str] = set()
+        local_done: set[str] = set()
         local_failed: set[str] = set()
 
         # memfabric pull mode: done comes from MembPullReadThread
@@ -412,6 +442,13 @@ class SFAPDRD2HConsumerWorker:
             ready_to_cleanup = self._deferred_finished_req_ids - self._dspark_pending_recv
             if ready_to_cleanup:
                 self._cleanup_request_state(ready_to_cleanup)
+        elif isinstance(self.engine, MooncakeSparseTransfer):
+            self._mooncake_completed_recv.update(done_recving)
+            self._mooncake_pending_recv.difference_update(done_recving)
+            self._deferred_finished_req_ids.update(finished_req_ids or ())
+            ready = self._deferred_finished_req_ids - self._mooncake_pending_recv
+            if ready:
+                self._cleanup_request_state(ready)
         elif finished_req_ids:
             self._cleanup_request_state(finished_req_ids)
 
@@ -479,10 +516,19 @@ class SFAPDRD2HConsumerWorker:
         if len(gvas_k) != len(main_names) or len(gvas_v) != len(main_names):
             raise RuntimeError("SparseKVOffloadManager shared CPU GVA/layer count mismatch")
         self._main_gva_bases = list(zip(gvas_k, gvas_v))
+        mooncake = _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MOONCAKE
+        if mooncake:
+            if not self.offload_manager.is_mooncake:
+                raise ValueError("Mooncake SFA PD requires the native Mooncake sparse pool")
+            self._main_gva_bases = [
+                tuple(self.offload_manager._mooncake_device_address(view, 0, view.numel() * view.element_size())
+                      for view in pair)
+                for pair in zip(k_caches_cpu, v_caches_cpu)
+            ]
         self._main_block_lens = self.offload_manager.cpu_block_lens
         if len(self._main_block_lens) != len(main_names):
             raise RuntimeError("SparseKVOffloadManager shared CPU block-size/layer count mismatch")
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 or mooncake:
             if len(k_caches_cpu) != len(main_names) or len(v_caches_cpu) != len(main_names):
                 raise RuntimeError("SparseKVOffloadManager CPU pool/layer count mismatch")
             self._cpu_pools = list(zip(k_caches_cpu, v_caches_cpu))
@@ -509,7 +555,7 @@ class SFAPDRD2HConsumerWorker:
             cpu_pool = self._cpu_pools[pool_idx]
             if cpu_pool is not None:
                 k_cpu, v_cpu = cpu_pool
-                addrs = [k_cpu.data_ptr(), v_cpu.data_ptr()]
+                addrs = list(self._main_gva_bases[pool_idx]) if mooncake else [k_cpu.data_ptr(), v_cpu.data_ptr()]
                 block_lens = [
                     k_cpu.element_size() * math.prod(k_cpu.shape[1:]),
                     v_cpu.element_size() * math.prod(v_cpu.shape[1:]),
@@ -540,6 +586,26 @@ class SFAPDRD2HConsumerWorker:
         # Create memfabric engine (no registration)
         self._ensure_engine()
         self._bind_copy_sfa_tail_destinations()
+        if mooncake:
+            manager = self.offload_manager
+            raw = manager.mooncake_raw
+            device_base = manager.mooncake_pool.resolve_range(
+                "raw", 0, 0, raw.numel(), address_domain="device"
+            ).address
+            if self.engine.register_memory(device_base, raw.numel(), owner=manager.mooncake_pool) != 0:
+                raise RuntimeError("Mooncake shared DDR device registration failed")
+            device_views = {
+                str(index): tensor
+                for index, tensor in enumerate(
+                    self._indexer_tensors + self._indexer_scale_tensors
+                    + manager.topk_buffers_k + manager.topk_buffers_v
+                )
+                if tensor is not None
+            }
+            regions = collect_storage_merged_register_regions(device_views)
+            for ptr, size in zip(regions.ptrs, regions.lengths):
+                if self.engine.register_memory(ptr, size, owner=device_views) != 0:
+                    raise RuntimeError("Mooncake sparse PD device registration failed")
         read_state = self._build_consumer_read_state()
         # Start MembPullReadThread (ZMQ ROUTER + memfabric read)
         self._mf_read_thread = MembPullReadThread(
@@ -593,6 +659,12 @@ class SFAPDRD2HConsumerWorker:
         read_thread = getattr(self, "_mf_read_thread", None)
         if read_thread is not None:
             read_thread.stop()
+        if isinstance(self.engine, MooncakeSparseTransfer):
+            if read_thread is not None and read_thread.is_alive():
+                raise MooncakeCompletionUnknown("Mooncake PD reader is still using registered buffers")
+            self.engine.close()
+            if self.engine.metrics.enabled:
+                logger.info("Mooncake sparse PD metrics: %s", self.engine.metrics_summary(wait=True))
 
 
 class SFAPDRD2HProducerWorker:
@@ -608,15 +680,16 @@ class SFAPDRD2HProducerWorker:
         # memfabric engine reads this during construction.
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         self._backend = _resolve_kv_transfer_backend(vllm_config)
-        if self._backend != BACKEND_MEMFABRIC:
+        if self._backend not in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE):
             raise RuntimeError(
                 "SfaRemoteD2HConnector P side supports MemFabric pull only (set transfer_backend=memfabric)."
             )
-        global_memfabric_te.configure(
-            role=MEMFABRIC_ROLE_PREFILL,
-            device_id=torch.npu.current_device(),
-            transfer_protocol=_resolve_memfabric_transfer_protocol(vllm_config),
-        )
+        if self._backend == BACKEND_MEMFABRIC:
+            global_memfabric_te.configure(
+                role=MEMFABRIC_ROLE_PREFILL,
+                device_id=torch.npu.current_device(),
+                transfer_protocol=_resolve_memfabric_transfer_protocol(vllm_config),
+            )
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.engine_id = engine_id
@@ -629,7 +702,19 @@ class SFAPDRD2HProducerWorker:
         self.side_channel_port = vllm_config.kv_transfer_config.kv_port + self.dp_rank * self.tp_size
         self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.last_layer_idx = self.total_layers - 1
-        self.engine = global_memfabric_te.get_transfer_engine(self.side_channel_host)
+        self.engine = (
+            MooncakeSparseTransfer(
+                self.side_channel_host, str(torch.npu.current_device()),
+                metrics_enabled=(vllm_config.additional_config or {}).get(
+                    "sparse_kv_offload_config", {}
+                ).get("mooncake_metrics", False),
+            )
+            if self._backend == BACKEND_MOONCAKE
+            else global_memfabric_te.get_transfer_engine(self.side_channel_host)
+        )
+        self._session_id = (
+            self.engine.unique_id if self._backend == BACKEND_MOONCAKE else global_memfabric_te.unique_id
+        )
         self.te_rpc_port = self.engine.get_rpc_port()
         self.kv_cache_specs = [group_spec.kv_cache_spec for group_spec in self.kv_cache_config.kv_cache_groups]
         self.block_size = [spec.block_size for spec in self.kv_cache_specs]
@@ -670,7 +755,7 @@ class SFAPDRD2HProducerWorker:
         (P is not pushing to D — D reads from P). Skip GET_META entirely
         to avoid flooding D's ROUTER with 61 unnecessary requests that
         delay MF_META / READ_READY_BATCH."""
-        if self._backend == BACKEND_MEMFABRIC:
+        if self._backend in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE):
             return req_meta
         raise RuntimeError("SfaRemoteD2HConnector P side supports memfabric pull only.")
 
@@ -686,7 +771,7 @@ class SFAPDRD2HProducerWorker:
 
         ``remote_host`` / ``local_block_ids`` are already correct from
         ``build_connector_meta``; main and indexer group ids remain separate."""
-        if self._backend == BACKEND_MEMFABRIC:
+        if self._backend in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE):
             self.current_layer = 0
             self._pd_dispatched_layers = set()
             self._active_dspark_requests = {}
@@ -759,13 +844,14 @@ class SFAPDRD2HProducerWorker:
         return ProducerSendState(
             last_layer_idx=self.last_layer_idx,
             layer_metadata=self.layer_metadata,
-            p_session=global_memfabric_te.unique_id,
+            p_session=self._session_id,
             main_group_idx=self.main_group_idx,
             indexer_group_idx=self.indexer_group_idx,
             block_sizes=tuple(self.block_size),
             layer_storage_slots=self.layer_storage_slots,
             producer_pp_rank=self.pp_rank,
             producer_pp_size=self.pp_size,
+            strict_completion=self._backend == BACKEND_MOONCAKE,
         )
 
     @staticmethod
@@ -789,7 +875,8 @@ class SFAPDRD2HProducerWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only.
-        assert self._backend == BACKEND_MEMFABRIC, "SfaRemoteD2HConnector P side supports memfabric pull only."
+        if self._backend not in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE):
+            raise ValueError("SFA PD producer requires memfabric or mooncake transfer_backend")
         layer2group_ids: dict[str, int] = {}
         for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             for layer_name in kv_cache_group.layer_names:
@@ -853,7 +940,12 @@ class SFAPDRD2HProducerWorker:
         # so draft layer indices cannot collide with target SFA layer indices.
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
-        global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        if self._backend == BACKEND_MOONCAKE:
+            for ptr, size in zip(register_regions.ptrs, register_regions.lengths):
+                if self.engine.register_memory(ptr, size, owner=kv_caches) != 0:
+                    raise RuntimeError("Mooncake SFA producer device registration failed")
+        else:
+            global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
         ready_event = threading.Event()
         send_state = self._build_producer_send_state()
@@ -873,7 +965,7 @@ class SFAPDRD2HProducerWorker:
             "MembPull P registered kv caches: target_layers=%d, dspark_draft_layers=%d, p_session=%s",
             len(self.layer_metadata),
             len(self.dspark_draft_kv_metadata),
-            global_memfabric_te.unique_id,
+            self._session_id,
         )
 
     def configure_dspark_draft_layers(self, layer_names: tuple[str, ...]) -> None:
@@ -996,7 +1088,7 @@ class SFAPDRD2HProducerWorker:
         D-notification is moved earlier so co-located pull overlaps attention.
         Idempotent per layer — save_kv_layer skips layers dispatched here.
         """
-        if self._backend != BACKEND_MEMFABRIC or self.kv_send_layer_thread is None:
+        if self._backend not in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE) or self.kv_send_layer_thread is None:
             return
         resolved_layer_name = layer_name or (
             self.stage_layer_names[self.current_layer] if self.current_layer < len(self.stage_layer_names) else None
@@ -1025,7 +1117,7 @@ class SFAPDRD2HProducerWorker:
         connector_metadata: KVConnectorMetadata,
         **kwargs,
     ) -> None:
-        if self._backend != BACKEND_MEMFABRIC:
+        if self._backend not in (BACKEND_MEMFABRIC, BACKEND_MOONCAKE):
             raise RuntimeError("SfaRemoteD2HConnector P side supports memfabric pull only.")
         send_thread = self.kv_send_layer_thread
         if send_thread is None:
@@ -1154,6 +1246,28 @@ class SFAPDRD2HProducerWorker:
             ) from error
         self.wait_for_layer_send(global_layer_idx)
 
+    def wait_for_save(self) -> None:
+        """Mooncake source blocks cannot retire before every remote read ACK.
+
+        This eager barrier is deliberately before normal scheduler recycling;
+        retaining tensor references alone cannot protect physical block IDs.
+        """
+        if self._backend != BACKEND_MOONCAKE:
+            return
+        for layer_idx in tuple(self._pd_dispatched_layers):
+            self.wait_for_layer_send(layer_idx)
+        if self.kv_send_layer_thread is not None and self.kv_send_layer_thread.quarantined_error is not None:
+            raise MooncakeCompletionUnknown(self.kv_send_layer_thread.quarantined_error)
+
     def shutdown(self) -> None:
+        if isinstance(self.engine, MooncakeSparseTransfer) and self.kv_send_layer_thread is not None:
+            if self.kv_send_layer_thread.quarantined_error is not None or any(
+                not event.is_set() for event in self.kv_send_layer_thread.storage_send_done_events
+            ):
+                raise MooncakeCompletionUnknown("Remote readers have not released the source KV registrations")
         if self.kv_send_layer_thread is not None:
             self.kv_send_layer_thread.stop()
+        if isinstance(self.engine, MooncakeSparseTransfer):
+            if self.kv_send_layer_thread is not None and self.kv_send_layer_thread.is_alive():
+                raise MooncakeCompletionUnknown("Mooncake PD sender still owns registered source buffers")
+            self.engine.close()

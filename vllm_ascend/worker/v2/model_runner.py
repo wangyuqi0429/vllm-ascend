@@ -21,6 +21,7 @@ import inspect
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -578,6 +579,9 @@ class NPUModelRunner(GPUModelRunner):
                 fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
 
     def shutdown(self) -> None:
+        manager = getattr(self, "sparse_kv_offload_manager", None)
+        if manager is not None:
+            manager.close()
         # Drop C8 packet views before the parent collects tensors and
         # empties the allocator cache.
         entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
@@ -622,6 +626,12 @@ class NPUModelRunner(GPUModelRunner):
     @torch.inference_mode()
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Capture decoder and multimodal encoder graphs on Ascend."""
+        sparse_manager = getattr(self, "sparse_kv_offload_manager", None)
+        if sparse_manager is not None:
+            resources = sparse_manager.retain_mooncake_graph_resources()
+            self._mooncake_graph_resources = resources
+            if resources:
+                self.get_model()._mooncake_graph_resources = resources
         if hasattr(self, "model_state") and self.model_state.supports_mm_inputs:
             encoder_runner = getattr(self.model_state, "encoder_runner", None)
             encoder_manager = getattr(encoder_runner, "cudagraph_manager", None)
@@ -680,9 +690,15 @@ class NPUModelRunner(GPUModelRunner):
         )
         profile_kwargs = {"randomize_inputs": randomize_inputs}
         forward_failed = True
+        sparse_manager = getattr(self, "sparse_kv_offload_manager", None)
+        if sparse_manager is not None:
+            sparse_manager.prepare_mooncake_step()
         with dp_coordination_context:
             try:
-                output = super().execute_model(
+                execute = super().execute_model
+                if sparse_manager is not None and getattr(sparse_manager, "is_mooncake", False):
+                    execute = partial(sparse_manager.run_mooncake_forward, execute)
+                output = execute(
                     scheduler_output,
                     intermediate_tensors=intermediate_tensors,
                     dummy_run=dummy_run,
@@ -692,6 +708,8 @@ class NPUModelRunner(GPUModelRunner):
                     valid_dummy_state_slots=valid_dummy_state_slots,
                     **profile_kwargs,
                 )
+                if sparse_manager is not None:
+                    sparse_manager.check_mooncake_status()
                 forward_failed = False
             finally:
                 finish_execution = getattr(self.model_state, "finish_execution", None)
@@ -1078,6 +1096,14 @@ class NPUModelRunner(GPUModelRunner):
         update_cos_sin(input_batch.positions)
 
         return input_batch
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # The upstream update zeroes freshly allocated blocks and applies COW.
+        # Restore Store prefixes only afterwards, before attention input setup.
+        super().update_requests(scheduler_output)
+        sparse_store_manager = getattr(self, "sparse_kv_offload_manager", None)
+        if sparse_store_manager is not None:
+            sparse_store_manager.process_mooncake_store_metadata(scheduler_output)
 
     def prepare_inputs(
         self,

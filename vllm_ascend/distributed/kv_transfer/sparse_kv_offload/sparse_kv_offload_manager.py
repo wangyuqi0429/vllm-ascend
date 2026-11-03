@@ -5,14 +5,9 @@ from zlib import adler32
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch_npu
 
-with contextlib.suppress(Exception):
-    # we should remove this after memfabric.offload is merged to master and available in ci machine.
-    # Importing the package provisions an AICPU kernel on the fly, which raises its own
-    # ProvisioningError rather than ImportError when the CANN build toolchain is incomplete.
-    # Sparse KV offload is opt-in, so nothing here may abort worker startup.
-    from memfabric_hybrid import offload  # type: ignore
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -32,6 +27,7 @@ from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.ascend_config import SparseKVOffloadConfig, get_ascend_config
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import copy_sfa_pool_capacity
+from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_sparse_metrics import SparseOffloadMetrics
 from vllm_ascend.utils import AscendDeviceType, enable_custom_op, get_ascend_device_type
 
 # Main BF16 cache:
@@ -46,6 +42,19 @@ OFFLOAD_V_CACHE_CPU_INDEX = 3
 OFFLOAD_TOPK_BUFFER_K_INDEX = 4
 OFFLOAD_TOPK_BUFFER_V_INDEX = 5
 OFFLOAD_STORE_PORT_BASE = 8500
+
+# Optional legacy runtime, initialized only when that backend is selected.
+# Kept as a module reference for the worker lifetime and existing test patches.
+offload = None
+
+
+def _legacy_offload():
+    global offload
+    if offload is None:
+        from memfabric_hybrid import offload as legacy_offload
+
+        offload = legacy_offload
+    return offload
 
 FSA_EXTERNAL_PLAN_READY_MARKER = 0x5A45
 FSA_PAIRED_SELECTION_COPY_MARKER = 0x5A56
@@ -189,7 +198,7 @@ def empty_aligned_int8_cpu_tensors(
     """
     chunk_nums = [cdiv(size, alignment) for size in sizes]
     total_chunk_num = 1 + sum(chunk_nums)
-    raw_tensor = offload.empty([total_chunk_num * alignment], dtype=torch.int8, pin_memory=True)
+    raw_tensor = _legacy_offload().empty([total_chunk_num * alignment], dtype=torch.int8, pin_memory=True)
     base_addr = raw_tensor.data_ptr()
     if base_addr % alignment:
         base_addr = (base_addr // alignment + 1) * alignment
@@ -250,6 +259,10 @@ def plan_sparse_kv_offload_memory(
     total_page_size_bytes = host_page_size_bytes + device_page_size_bytes
 
     host_alignment_reserve_bytes = len(host_specs) * _CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
+    sparse_options = (getattr(vllm_config, "additional_config", None) or {}).get("sparse_kv_offload_config", {})
+    if sparse_options.get("backend") == "mooncake" and sparse_options.get("mooncake_attention_mode") == "fused_overlap":
+        rows = min(vllm_config.scheduler_config.max_num_batched_tokens, vllm_config.scheduler_config.max_num_seqs)
+        host_alignment_reserve_bytes += rows * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT * 2
     usable_dram_bytes = max(dram_limit_bytes - host_alignment_reserve_bytes, 0)
     dram_limit_blocks = usable_dram_bytes // host_page_size_bytes
 
@@ -324,11 +337,16 @@ def allocate_kv_cache_tensors_for_sparse_kv_offload(
     tp_rank: int,
     keep_device_kv_cache: bool,
     npu_kv_cache_allocate_func: typing.Callable,
+    *,
+    layer_name: str | None = None,
 ):
-    if tp_rank == 0:
+    if getattr(get_ascend_config().sparse_kv_offload_config, "backend", "memfabric") == "mooncake":
+        k_tensor_cpu, v_tensor_cpu = get_sparse_kv_offload_manager().allocate_mooncake_views(
+            (k_tensor_size, v_tensor_size), alignment, layer_name=layer_name
+        )
+    elif tp_rank == 0:
         [k_tensor_cpu, v_tensor_cpu] = empty_aligned_int8_cpu_tensors(
-            [k_tensor_size, v_tensor_size],
-            alignment,
+            [k_tensor_size, v_tensor_size], alignment
         )
     else:
         k_tensor_cpu = None
@@ -387,9 +405,13 @@ def reshape_kv_cache_tensors_for_sparse_kv_offload(
     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape) if raw_k_tensor is not None else None
     v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape) if raw_v_tensor is not None else None
 
-    if tp_rank == 0:
+    if tp_rank == 0 or sparse_kv_offload_config.backend == "mooncake":
         k_cache_cpu = raw_k_tensor_cpu.view(k_cache_dtype).view(k_shape)
         v_cache_cpu = raw_v_tensor_cpu.view(v_cache_dtype).view(v_shape)
+        if sparse_kv_offload_config.backend == "mooncake":
+            owner = get_sparse_kv_offload_manager().mooncake_pool
+            k_cache_cpu._mooncake_pool = owner
+            v_cache_cpu._mooncake_pool = owner
     else:
         k_cache_cpu = None
         v_cache_cpu = None
@@ -490,6 +512,23 @@ class SparseKVOffloadManager:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.sparse_kv_offload_config = sparse_kv_offload_config
+        self.is_mooncake = sparse_kv_offload_config.backend == "mooncake"
+        self.mooncake_device_execution = self.is_mooncake and sparse_kv_offload_config.mooncake_attention_mode != "unfused"
+        self.mooncake_fused_copy = self.is_mooncake and sparse_kv_offload_config.execute_fused_copy_sfa
+        self._closed = False
+        self._mooncake_inflight = None
+        self.mooncake_metrics = SparseOffloadMetrics(
+            enabled=self.is_mooncake and sparse_kv_offload_config.mooncake_metrics,
+            npu_runtime=torch_npu.npu,
+        )
+        self._mooncake_cache_metric_refs = {}
+        self._mooncake_metric_step = 0
+        self._mooncake_metric_recorded_step = -1
+        self._mooncake_store = None
+        self._mooncake_store_blocks = {}
+        self._mooncake_store_ready = set()
+        self._mooncake_store_computed = {}
+        self._mooncake_store_failed = False
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -520,11 +559,16 @@ class SparseKVOffloadManager:
         self.fused_overlap_plan_topk: int | None = None
         self.fused_overlap_plan_num_tokens = 0
         self.fused_overlap_plan_membership_map: torch.Tensor | None = None
-        _sparse_kv_ops()
+        if not self.is_mooncake or self.use_fused_overlap:
+            _sparse_kv_ops()
 
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30))
         planned_pool_size_bytes = get_sparse_kv_offload_cpu_pool_size_bytes(kv_cache_config)
-        if planned_pool_size_bytes > dram_limit_bytes:
+        self._mooncake_aux_bytes = (
+            self.max_num_topk_rows * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT * 2
+            if self.is_mooncake and self.use_fused_overlap else 0
+        )
+        if planned_pool_size_bytes + self._mooncake_aux_bytes > dram_limit_bytes:
             raise ValueError(
                 "Sparse KV offload planned CPU pool exceeds DRAM limit after "
                 "alignment: "
@@ -540,17 +584,614 @@ class SparseKVOffloadManager:
             sparse_kv_offload_config.dram_size_per_dp_GB,
             kv_cache_config.num_blocks,
         )
-        config = offload.OffloadConfig()
+        if self.is_mooncake:
+            from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_sparse_adapter import (
+                MooncakeSparsePool,
+                SharedKVBlock,
+            )
+
+            mode = sparse_kv_offload_config.mooncake_memory_mode
+            self.mooncake_pool = MooncakeSparsePool.create(
+                "vllm_sparse_kv",
+                {"raw": SharedKVBlock(1, (actual_pool_size_bytes // 2,))},
+                device_id=torch_npu.npu.current_device(),
+                world_size=self.tp_size,
+                rank_id=self.tp_rank,
+                comm_group=self.tp_group if self.tp_size > 1 else None,
+                mmap=mode == "mmap_registered",
+                host_register=mode == "mmap_registered",
+            )
+            view_error = None
+            try:
+                self.mooncake_raw = self.mooncake_pool.host_tensors("raw")[0].view(torch.int8)
+                self.mooncake_pool.resolve_range("raw", 0, 0, 0, address_domain="device")
+            except BaseException as exception:
+                view_error = exception
+            try:
+                self._mooncake_check_phase(view_error, "Host/device mapping")
+            except BaseException:
+                self.mooncake_raw = None
+                self.mooncake_pool = None
+                self._closed = True
+                raise
+            self._mooncake_layout_offset = 0
+            self._mooncake_regions: list[tuple[int, int]] = []
+            if self.mooncake_device_execution:
+                host_address = self.mooncake_pool.resolve_range("raw", 0, 0, 0, address_domain="host").address
+                device_address = self.mooncake_pool.resolve_range("raw", 0, 0, 0, address_domain="device").address
+                if host_address != device_address:
+                    raise ValueError("Mooncake fused kernels require verified equal Host/device VMM addresses")
+                from mooncake.sparse_copy import sparse_copy
+
+                self._mooncake_native_copy = sparse_copy
+            return
+
+        config = _legacy_offload().OffloadConfig()
         config.device_id = torch_npu.npu.current_device()
         config.reserve_size = actual_pool_size_bytes
         config.alloc_size = actual_pool_size_bytes if self.tp_rank == 0 else 0
         config.world_size = self.tp_size
         config.rank_id = self.tp_rank
-        config.scene = offload.Scene.SHARED
+        config.scene = _legacy_offload().Scene.SHARED
         store_port = OFFLOAD_STORE_PORT_BASE + parallel_config.data_parallel_index
         config.store_url = f"tcp://127.0.0.1:{store_port}"
-        assert offload.initialize(config) == 0, "Sparse KV offload offload.initialize failed."
+        assert _legacy_offload().initialize(config) == 0, "Sparse KV offload offload.initialize failed."
         self.tp_group.barrier()
+
+    def _mooncake_check_phase(self, error: BaseException | None, phase: str) -> None:
+        """All ranks leave an ordinary failure phase together, before reuse."""
+        if self.tp_size > 1:
+            errors = [None] * self.tp_size
+            dist.all_gather_object(
+                errors, str(error) if error is not None else None, group=self.tp_group.cpu_group
+            )
+            if any(item is not None for item in errors):
+                raise RuntimeError(f"Mooncake TP {phase} failed: {errors}") from error
+        elif error is not None:
+            raise error
+
+    def allocate_mooncake_views(
+        self, sizes: tuple[int, ...], alignment: int, *, layer_name: str | None = None
+    ) -> tuple[torch.Tensor, ...]:
+        """Carve initialization-time byte layout; this never assigns KV slots."""
+        if self._closed or not self.is_mooncake:
+            raise RuntimeError("Mooncake pool is unavailable")
+        if alignment <= 0 and self.tp_size == 1:
+            raise ValueError("KV byte alignment must be positive")
+        base = self.mooncake_raw.data_ptr()
+        offset = self._mooncake_layout_offset
+        if self.tp_size > 1:
+            declarations = [None] * self.tp_size
+            dist.all_gather_object(
+                declarations, (layer_name, offset, tuple(sizes), alignment), group=self.tp_group.cpu_group
+            )
+            if any(declaration != declarations[0] for declaration in declarations):
+                raise ValueError("TP ranks disagree on Mooncake KV allocation order or byte layout")
+            payload = None
+            if self.tp_rank == 0:
+                try:
+                    if alignment <= 0:
+                        raise ValueError("KV byte alignment must be positive")
+                    planned = []
+                    for size in sizes:
+                        if size < 0 or size % 2:
+                            raise ValueError("BF16 KV allocation byte sizes must be nonnegative and even")
+                        offset = cdiv(base + offset, alignment) * alignment - base
+                        if offset + size > self.mooncake_raw.numel():
+                            raise ValueError("Mooncake KV layout exceeds the planned shared pool")
+                        planned.append((offset, size))
+                        offset += size
+                    payload = ("", planned, offset)
+                except Exception as error:
+                    payload = (str(error), [], 0)
+            error, regions, next_offset = self.tp_group.broadcast_object(payload, src=0)
+            if error:
+                raise ValueError(error)
+            # Byte kernels need BF16 alignment, not the owner's optional
+            # huge-page packing hint. All ranks reuse the same relative layout.
+            mapping_error = (
+                "TP mapping cannot represent the agreed BF16 byte layout"
+                if any((base + start) % 2 or start + size > self.mooncake_raw.numel() for start, size in regions)
+                else None
+            )
+            mapping_errors = [None] * self.tp_size
+            dist.all_gather_object(mapping_errors, mapping_error, group=self.tp_group.cpu_group)
+            if any(item is not None for item in mapping_errors):
+                raise ValueError(str(mapping_errors))
+            self._mooncake_layout_offset = next_offset
+            self._mooncake_regions.extend(regions)
+            return tuple(self.mooncake_raw[start : start + size] for start, size in regions)
+        regions = []
+        for size in sizes:
+            if size < 0 or size % 2:
+                raise ValueError("BF16 KV allocation byte sizes must be nonnegative and even")
+            offset = cdiv(base + offset, alignment) * alignment - base
+            if offset + size > self.mooncake_raw.numel():
+                raise ValueError("Mooncake KV layout exceeds the planned shared pool")
+            regions.append((offset, size))
+            offset += size
+        self._mooncake_layout_offset = offset
+        self._mooncake_regions.extend(regions)
+        return tuple(self.mooncake_raw[start : start + size] for start, size in regions)
+
+    def _prepare_mooncake_store_sidecars(self) -> None:
+        if self._mooncake_store_sidecar_pool is not None:
+            return
+        from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_sparse_adapter import (
+            MooncakeSparsePool, SharedKVBlock,
+        )
+        sizes = [entry[4] for entry in self._mooncake_store_sidecars]
+        total = sum(sizes)
+        if self.mooncake_raw.numel() + total + self._mooncake_aux_bytes > int(
+            self.sparse_kv_offload_config.dram_size_per_dp_GB * (1 << 30)
+        ):
+            raise ValueError("Sparse Store sidecar staging exceeds configured DRAM budget")
+        if any(size % 2 for size in sizes):
+            raise ValueError("Sparse Store sidecar page bytes must have BF16 storage alignment")
+        self._mooncake_store_sidecar_pool = MooncakeSparsePool.create(
+            "vllm_sparse_store_sidecars", {"raw": SharedKVBlock(1, (total // 2,))},
+            device_id=torch_npu.npu.current_device(), world_size=self.tp_size, rank_id=self.tp_rank,
+            comm_group=self.tp_group if self.tp_size > 1 else None, mmap=False, host_register=False,
+        )
+        self._mooncake_store_sidecar_raw = self._mooncake_store_sidecar_pool.host_tensors("raw")[0].view(torch.uint8)
+        self._mooncake_store_sidecar_ranges, self._mooncake_store_sidecar_views = [], []
+        offset = 0
+        for size in sizes:
+            self._mooncake_store_sidecar_ranges.append(self._mooncake_store_sidecar_pool.resolve_range(
+                "raw", 0, offset, size, address_domain="host"))
+            self._mooncake_store_sidecar_views.append(self._mooncake_store_sidecar_raw[offset:offset + size])
+            offset += size
+
+    def _copy_mooncake_store_sidecars(self, physical_blocks, *, to_device: bool) -> None:
+        for entry, staging, physical in zip(
+            self._mooncake_store_sidecars, self._mooncake_store_sidecar_views, physical_blocks
+        ):
+            device_page = entry[5][physical]
+            if to_device:
+                device_page.copy_(staging, non_blocking=False)
+            elif self.tp_rank == 0:
+                staging.copy_(device_page, non_blocking=False)
+        torch_npu.npu.current_stream().synchronize()
+
+    def _hydrate_mooncake_store_main(self, physical: int) -> None:
+        for name, k_host, v_host, sizes in zip(
+            self.offload_layer_names, self.k_caches_cpu, self.v_caches_cpu, self.cpu_block_lens
+        ):
+            for destination, host, size in zip(self._mooncake_store_main_hbm[name], (k_host, v_host), sizes):
+                if destination is None:  # decode-only consumer uses the Host pool
+                    continue
+                rows = destination.view(torch.uint8).reshape(-1, size)
+                source = host.view(torch.uint8).reshape(-1, size)
+                rows[physical].copy_(source[physical], non_blocking=False)
+        torch_npu.npu.current_stream().synchronize()
+
+    def assert_mooncake_store_shutdown_safe(self) -> None:
+        if not self.is_mooncake:
+            return
+        bridge = getattr(self, "_mooncake_store", None)
+        error = None
+        if bridge is not None and bridge.gate.poisoned:
+            error = RuntimeError("Store completion unknown: retain client, slots and registrations")
+        self._mooncake_check_phase(error, "Store shutdown preflight")
+
+    def process_mooncake_store_metadata(self, scheduler_output) -> None:
+        """Execute synchronous Store transactions before the framework forward.
+
+        Scheduler block assignments are authoritative; metadata supplies only
+        request/hash coordinates. No raw pointer or arbitrary range is accepted.
+        A failed transaction is instance fail-stop, so no partial pool can run.
+        """
+        if not self.is_mooncake:
+            return
+        if self._closed or self._mooncake_store_failed:
+            raise RuntimeError("Mooncake Store instance cannot admit another step")
+        if self._mooncake_store is not None and self._mooncake_store.gate.poisoned:
+            raise RuntimeError("Mooncake Store completion is unknown; retain slots and client")
+        error = None
+        try:
+            # Prior graph and side-stream accesses must retire before any pool write
+            # or scheduler assignment can be reused by the synchronous transaction.
+            for req_id in getattr(scheduler_output, "finished_req_ids", ()):
+                self._mooncake_store_blocks.pop(req_id, None)
+                self._mooncake_store_computed.pop(req_id, None)
+                self._mooncake_store_ready.discard(req_id)
+            for request in scheduler_output.scheduled_new_reqs:
+                self._mooncake_store_blocks[request.req_id] = tuple(list(g) for g in request.block_ids)
+                self._mooncake_store_ready.discard(request.req_id)
+                self._mooncake_store_computed[request.req_id] = request.num_computed_tokens
+            cached = scheduler_output.scheduled_cached_reqs
+            if len(cached.req_ids) != len(cached.new_block_ids) or len(cached.req_ids) != len(cached.num_computed_tokens):
+                raise ValueError("Store scheduler cached vectors differ in length")
+            for req_id, computed in zip(cached.req_ids, cached.num_computed_tokens):
+                self._mooncake_store_computed[req_id] = computed
+            for req_id, additions in zip(cached.req_ids, cached.new_block_ids):
+                if additions is None:
+                    continue
+                if req_id in cached.resumed_req_ids:
+                    self._mooncake_store_blocks[req_id] = tuple(list(g) for g in additions)
+                    self._mooncake_store_ready.discard(req_id)
+                else:
+                    current = self._mooncake_store_blocks.get(req_id)
+                    if current is None:
+                        raise ValueError("Store scheduler snapshot is missing a cached request")
+                    if len(current) != len(additions):
+                        raise ValueError("Store scheduler group count changed")
+                    for group, extra in zip(current, additions):
+                        group.extend(extra)
+            metadata = scheduler_output.kv_connector_metadata
+            imports = tuple(getattr(metadata, "sparse_store_imports", ()))
+            seals = tuple(getattr(metadata, "sparse_store_seals", ()))
+        except BaseException as exception:
+            error = exception
+        try:
+            self._mooncake_check_phase(error, "Store scheduler metadata")
+            if self.tp_size > 1:
+                signatures = [None] * self.tp_size
+                dist.all_gather_object(signatures, repr((imports, seals)), group=self.tp_group.cpu_group)
+                if any(value != signatures[0] for value in signatures):
+                    raise ValueError("TP ranks received different Store transactions")
+        except BaseException:
+            self._mooncake_store_failed = True
+            raise
+        error = None
+        transactions = []
+        try:
+            if imports or seals:
+                if self.vllm_config.kv_transfer_config is not None:
+                    raise ValueError("Sparse Store metadata cannot share a step/client with a PD connector")
+                main_group = self._mooncake_store_main_group
+                if self.tp_size > 1 and self._mooncake_store_nonreplicated_sidecars:
+                    raise ValueError("TP Sparse Store supports only proven replicated DeepseekV32IndexerCache sidecars")
+                if main_group is None:
+                    raise ValueError("Sparse Store main group was not registered")
+                if not self._mooncake_store_sidecars:
+                    raise ValueError("Sparse Store must register the model indexer sidecars")
+                self._prepare_mooncake_store_sidecars()
+                # Explicit drain at this external transaction boundary, never inside
+                # graph capture. It proves old hot readers have stopped before import.
+                torch_npu.npu.synchronize()
+                if self.mooncake_device_execution:
+                    self.check_mooncake_status()
+                from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.mooncake_sparse_store import (
+                    MooncakeSparseStore, StoreSessionGate, StoreObject, StoreRange,
+                )
+                transactions = []
+                occupied = {}
+                for owner, groups in self._mooncake_store_blocks.items():
+                    for group_id, blocks in enumerate(groups):
+                        for block in blocks:
+                            coordinate = (group_id, block)
+                            if coordinate in occupied:
+                                raise ValueError("Store active block aliases another logical/request block")
+                            occupied[coordinate] = owner
+                fresh_ids = {request.req_id for request in scheduler_output.scheduled_new_reqs}
+                import_indices = {}
+                for item in imports:
+                    if not isinstance(item, dict) or item.get("req_id") not in fresh_ids:
+                        raise ValueError("Store imports require a newly admitted request with fresh hot residency")
+                    import_indices.setdefault(item["req_id"], []).append(item.get("block_index"))
+                for req_id, indices in import_indices.items():
+                    computed = self._mooncake_store_computed[req_id]
+                    if computed % self.block_size or sorted(indices) != list(range(computed // self.block_size)):
+                        raise ValueError("Store import must cover the complete scheduler skipped full-block prefix")
+                for seal, items in ((False, imports), (True, seals)):
+                    objects, requests = [], set()
+                    for item in items:
+                        if not isinstance(item, dict) or set(item) != {"req_id", "block_hash", "block_index"}:
+                            raise ValueError("Store item requires req_id/block_hash/block_index only")
+                        req_id, logical = item["req_id"], item["block_index"]
+                        if isinstance(logical, bool) or not isinstance(logical, int) or logical < 0:
+                            raise ValueError("Store block_index must be nonnegative integer")
+                        blocks = self._mooncake_store_blocks.get(req_id)
+                        if blocks is None or logical >= len(blocks[main_group]):
+                            raise ValueError("Store target is not reserved by the scheduler for this request")
+                        if seal and (logical + 1) * self.block_size > self._mooncake_store_computed.get(req_id, 0):
+                            raise ValueError("Store seal requires a fully computed immutable prefix block")
+                        physical = blocks[main_group][logical]
+                        if not 0 <= physical < self.kv_cache_config.num_blocks:
+                            raise ValueError("Store physical block exceeds active pool")
+                        fragments, offset = [], 0
+                        for k, v, sizes in zip(self.k_caches_cpu, self.v_caches_cpu, self.cpu_block_lens):
+                            for tensor, size in zip((k, v), sizes):
+                                pool_offset = tensor.data_ptr() - self.mooncake_raw.data_ptr() + physical * size
+                                region = self.mooncake_pool.resolve_range("raw", 0, pool_offset, size, address_domain="host")
+                                fragments.append(StoreRange(region, offset))
+                                offset += size
+                        sidecar_targets = []
+                        for entry, staging in zip(self._mooncake_store_sidecars, self._mooncake_store_sidecar_ranges):
+                            group_id, name, component, dtype, page_bytes, device_pages = entry
+                            if group_id >= len(blocks) or logical >= len(blocks[group_id]):
+                                raise ValueError("Sparse Store sidecar block was not allocated to the request")
+                            sidecar_block = blocks[group_id][logical]
+                            if not 0 <= sidecar_block < device_pages.shape[0]:
+                                raise ValueError("Sparse Store sidecar physical block is invalid")
+                            fragments.append(StoreRange(staging, offset))
+                            offset += page_bytes
+                            sidecar_targets.append(sidecar_block)
+                        # Existing bound key builder includes model/topology/layout.
+                        objects.append((item["block_hash"], offset, tuple(fragments), physical, tuple(sidecar_targets)))
+                        requests.add(req_id)
+                    transactions.append((seal, objects, requests))
+                if self._mooncake_store is None:
+                    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
+                    backend = MooncakeBackend(
+                        self.vllm_config.parallel_config, contribute_memory=False, dedicated_transfer_engine=True
+                    )
+                    builder = backend.bind_layerwise_keys(
+                        vllm_config=self.vllm_config, kv_cache_config=self.kv_cache_config,
+                        model_name=self.vllm_config.model_config.model + ":native-sparse-full-v1", use_hybrid=True,
+                        grouped_block_size=[self.block_size] * len(self.kv_cache_config.kv_cache_groups),
+                    )
+                    token = repr((tuple(self.offload_layer_names), tuple(self.cpu_block_lens),
+                                  "bfloat16", self.tp_size, self.block_size,
+                                      tuple(entry[:5] for entry in self._mooncake_store_sidecars)))
+                    regions = [self.mooncake_pool.resolve_range("raw", 0, start, size, address_domain="host")
+                               for start, size in self._mooncake_regions]
+                    regions.extend(self._mooncake_store_sidecar_ranges)
+                    self._mooncake_store = MooncakeSparseStore(
+                        backend, regions, builder, token, session_gate=StoreSessionGate(backend),
+                        exclusive_session_client=True,
+                    )
+        except BaseException as exception:
+            error = exception
+        try:
+            self._mooncake_check_phase(error, "Store validation/setup")
+            for seal, objects, requests in transactions:
+                if not objects:
+                    continue
+                bridge = self._mooncake_store
+                for hash_value, size, ranges, physical, sidecar_blocks in objects:
+                    bound = (StoreObject(self._mooncake_store_main_group, hash_value, 0, 0, size,
+                                         bridge.layout_token, ranges),)
+                    error = None
+                    try:
+                        if seal:
+                            self._copy_mooncake_store_sidecars(sidecar_blocks, to_device=False)
+                        with self.mooncake_metrics.measure("store_seal" if seal else "store_import", host_includes_wait=True):
+                            if self.tp_rank == 0:
+                                (bridge.seal_objects if seal else bridge.import_objects)(bound)
+                    except BaseException as exception:
+                        error = exception
+                    self._mooncake_check_phase(error, "Store transaction")
+                    error = None
+                    try:
+                        if not seal:
+                            self._copy_mooncake_store_sidecars(sidecar_blocks, to_device=True)
+                            self._hydrate_mooncake_store_main(physical)
+                    except BaseException as exception:
+                        error = exception
+                    self._mooncake_check_phase(error, "Store model hydration")
+                if not seal:
+                    self._mooncake_store_ready.update(requests)
+        except BaseException:
+            # Snapshot reservations and the bridge remain held even on ordinary
+            # failure. The instance cannot consume partial data or reuse slots.
+            self._mooncake_store_failed = True
+            raise
+
+    def _mooncake_device_address(self, tensor: torch.Tensor, offset: int, length: int) -> int:
+        capacity = tensor.numel() * tensor.element_size()
+        if offset < 0 or length < 0 or offset > capacity or length > capacity - offset:
+            raise ValueError("Mooncake KV range exceeds its tensor view")
+        pool_offset = tensor.data_ptr() - self.mooncake_raw.data_ptr() + offset
+        if not any(start <= pool_offset and pool_offset + length <= start + size for start, size in self._mooncake_regions):
+            raise ValueError("Mooncake address is outside the declared KV byte layout")
+        return self.mooncake_pool.resolve_range("raw", 0, pool_offset, length, address_domain="device").address
+
+    def _mooncake_copy(self, sources, destinations, lengths, owners) -> None:
+        """Eager bytes: retain every source until stream completion is proven."""
+        if self._closed or self._mooncake_inflight is not None:
+            raise RuntimeError("Mooncake copy is closed or has an unresolved operation")
+        if not (len(sources) == len(destinations) == len(lengths)):
+            raise ValueError("Mooncake copy descriptor sizes differ")
+        if not sources:
+            return
+        target_ranges = []
+        for source, destination, length in zip(sources, destinations, lengths):
+            if (
+                not isinstance(source, int)
+                or not isinstance(destination, int)
+                or not isinstance(length, int)
+                or source <= 0
+                or destination <= 0
+                or length < 0
+                or source + length > (1 << 63) - 1
+                or destination + length > (1 << 63) - 1
+            ):
+                raise ValueError("Mooncake byte descriptors must fit nonnegative int64 address intervals")
+            if length and any(destination < end and start < destination + length for start, end in target_ranges):
+                raise ValueError("Mooncake byte copy targets overlap")
+            if length:
+                target_ranges.append((destination, destination + length))
+        from mooncake.sparse_copy import sparse_copy
+
+        device = self.topk_buffers_k[0].device
+        with torch_npu.npu.device(device):
+            with self.mooncake_metrics.measure("descriptor"):
+                src = torch.tensor(sources, dtype=torch.int64, device=device)
+                dst = torch.tensor(destinations, dtype=torch.int64, device=device)
+                size = torch.tensor(lengths, dtype=torch.int64, device=device)
+                count = torch.tensor([len(sources)], dtype=torch.int32, device=device)
+                status = torch.zeros(1, dtype=torch.int32, device=device)
+            stream = torch_npu.npu.current_stream()
+            self._mooncake_inflight = (stream, owners, src, dst, size, count, status)
+            with self.mooncake_metrics.measure("submit", sum(lengths), device=True):
+                sparse_copy(src, dst, size, count, status)
+            with self.mooncake_metrics.measure("wait", host_includes_wait=True):
+                stream.synchronize()
+            self._mooncake_inflight = None
+            if status.item() != 0:
+                raise RuntimeError("Mooncake sparse byte execution rejected descriptors")
+
+    def warmup_mooncake_native_copy(self) -> None:
+        """Compile the fixed D2H descriptor signature before graph capture."""
+        if not getattr(self, "mooncake_device_execution", False):
+            return
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("Mooncake byte-kernel warmup must precede graph capture")
+        self.d2h_size_npu.zero_()
+        self._mooncake_native_copy(
+            self.d2h_src_ptrs_npu, self.d2h_dst_ptrs_npu, self.d2h_lengths_npu,
+            self.d2h_size_npu, self.mooncake_status[0, 0],
+        )
+        self.mooncake_h2d_count.zero_()
+        self._mooncake_native_copy(
+            self.mooncake_h2d_src, self.mooncake_h2d_dst, self.mooncake_h2d_lengths,
+            self.mooncake_h2d_count, self.mooncake_status[0, 1],
+        )
+        torch_npu.npu.current_stream().synchronize()
+        self.mooncake_status.zero_()
+
+    def check_mooncake_status(self) -> None:
+        """Check independent sticky layer statuses before publishing outputs."""
+        if not getattr(self, "mooncake_device_execution", False):
+            return
+        if torch.npu.is_current_stream_capturing():
+            return
+        current = torch_npu.npu.current_stream()
+        for name in ("current_kv_save_stream", "fused_plan_stream"):
+            stream = getattr(self, name, None)
+            if stream is not None:
+                current.wait_stream(stream)
+        if bool(torch.any(self.mooncake_status != 0).item()):
+            raise RuntimeError("Mooncake native copy rejected a replay descriptor; results are invalid")
+        plan_status = getattr(self, "fused_plan_status_npu", None)
+        if plan_status is not None and int(plan_status.item()) != 0:
+            raise RuntimeError("Mooncake overlap planner failed; results are invalid")
+        if (
+            self.mooncake_metrics.enabled
+            and self.sparse_kv_offload_config.mooncake_execution_mode == "eager"
+            and self._mooncake_metric_recorded_step != self._mooncake_metric_step
+        ):
+            for misses, cache, logical, query_ends in self._mooncake_cache_metric_refs.values():
+                end_values = query_ends.cpu().tolist()
+                cache_values, logical_values = cache.cpu().tolist(), logical.cpu().tolist()
+                active = int(end_values[-1]) if end_values else 0
+                miss_count = int(misses[:active].sum().item())
+                total = 0
+                begin = 0
+                for row, end in enumerate(end_values):
+                    total += (end - begin) * (logical_values[row] if cache_values[row] == 0 else self.topk)
+                    begin = end
+                self.mooncake_metrics.record_cache(max(total - miss_count, 0), miss_count)
+            self._mooncake_metric_recorded_step = self._mooncake_metric_step
+        self.mooncake_metrics.collect(wait=False)
+
+    def prepare_mooncake_step(self) -> None:
+        if not getattr(self, "mooncake_device_execution", False) or torch.npu.is_current_stream_capturing():
+            return
+        if self._closed:
+            raise RuntimeError("Mooncake graphs cannot replay after their pool is closed")
+        self.check_mooncake_status()
+        self.mooncake_status.zero_()
+        self._mooncake_metric_step += 1
+        self._mooncake_cache_metric_refs.clear()
+
+    def run_mooncake_forward(self, forward, *args, **kwargs):
+        """Measure actual replay/eager execution from the outer Python caller."""
+        with self.mooncake_metrics.measure("model_forward", device=True):
+            return forward(*args, **kwargs)
+
+    def mooncake_metrics_summary(self, *, wait: bool = False) -> dict:
+        self.mooncake_metrics.collect(wait=wait)
+        result = self.mooncake_metrics.summary()
+        result["coverage"] = {
+            "cache_counts": "eager LIM only; graph and fused_overlap cache counts are not collected",
+            "native_copy": "current-stream event spans; graph capture skips per-operation timing",
+            "graph_bytes": "not inferred from reserved capacity; graph bandwidth is not reported",
+            "model_forward": "actual outer eager/replay call; capture timing is skipped",
+        }
+        return result
+
+    def retain_mooncake_graph_resources(self) -> tuple:
+        """Attach this lease to the graph wrapper, not a temporary tensor view."""
+        if not getattr(self, "mooncake_device_execution", False):
+            return ()
+        self.warmup_mooncake_native_copy()
+        return (self, self.mooncake_pool, self.mooncake_raw, getattr(self, "mooncake_membership_segment", None))
+
+    def close(self) -> None:
+        """Release resources only after successful device completion."""
+        if self._closed:
+            return
+        if self.is_mooncake:
+            # Refuse future forwards before draining. Final CPU tensor views
+            # retain their pool independently of manager/worker teardown.
+            self._closed = True
+            error = None
+            try:
+                if self._mooncake_inflight is not None:
+                    self._mooncake_inflight[0].synchronize()
+                torch_npu.npu.synchronize()
+                bridge = getattr(self, "_mooncake_store", None)
+                if bridge is not None:
+                    bridge.close()
+            except BaseException as exception:
+                error = exception
+            try:
+                self._mooncake_check_phase(error, "resource drain")
+            except BaseException:
+                self._closed = False
+                raise
+            self._mooncake_inflight = None
+            if self.tp_size > 1:
+                # Every rank has stopped all sanctioned users before the
+                # owner's resources can retire. Closed pools admit no new work.
+                self.tp_group.barrier()
+                if self.tp_rank != 0:
+                    self._mooncake_store_sidecar_pool = None
+                    self._mooncake_store_sidecar_raw = None
+                    self._mooncake_store_sidecar_views = []
+                    self._mooncake_store_sidecar_ranges = []
+                    self.mooncake_raw = None
+                    self.mooncake_pool = None
+                self.tp_group.barrier()
+            self._mooncake_store_sidecar_pool = None
+            self._mooncake_store_sidecar_raw = None
+            self._mooncake_store_sidecar_views = []
+            self._mooncake_store_sidecar_ranges = []
+            self.mooncake_raw = None
+            self.mooncake_pool = None
+        self._closed = True
+
+    def reload_mooncake_lim(self, layer_name, source_ids, destination_slots, counts, source_table, target_table):
+        """Execute the existing LIM request miss plan without changing selection."""
+        layer_id = self._get_offload_layer_id(layer_name)
+        sources_by_request = source_ids.cpu().tolist()
+        targets_by_request = destination_slots.cpu().tolist()
+        request_counts = counts.cpu().tolist()
+        host_table = source_table.cpu().tolist()
+        hot_table = target_table.cpu().tolist()
+        plan = {}
+        for request, count in enumerate(request_counts):
+            if count < 0 or count > len(sources_by_request[request]):
+                raise ValueError("LIM miss count exceeds descriptor capacity")
+            for source, target in zip(sources_by_request[request][:count], targets_by_request[request][:count]):
+                if source < 0 or target < 0:
+                    raise ValueError("Active LIM misses must have nonnegative source and target")
+                src_block, src_token = divmod(source, self.block_size)
+                dst_block, dst_token = divmod(target, self.block_size)
+                if src_block >= len(host_table[request]) or dst_block >= len(hot_table[request]):
+                    raise ValueError("LIM miss exceeds its block table")
+                physical_src = host_table[request][src_block] * self.block_size + src_token
+                physical_dst = hot_table[request][dst_block] * self.block_size + dst_token
+                if physical_src < 0 or physical_dst < 0:
+                    raise ValueError("LIM miss references an invalid physical block")
+                if physical_dst in plan and plan[physical_dst] != physical_src:
+                    raise ValueError("LIM plan maps different sources to one hot slot")
+                plan[physical_dst] = physical_src
+        srcs, dsts, sizes = [], [], []
+        for host, hot, token_bytes in (
+            (self.k_caches_cpu[layer_id], self.topk_buffers_k[layer_id], self.token_size_bytes_k),
+            (self.v_caches_cpu[layer_id], self.topk_buffers_v[layer_id], self.token_size_bytes_v),
+        ):
+            for target, source in plan.items():
+                if target * token_bytes + token_bytes > hot.numel() * hot.element_size():
+                    raise ValueError("LIM destination exceeds its hot KV buffer")
+                srcs.append(self._mooncake_device_address(host, source * token_bytes, token_bytes))
+                dsts.append(hot.data_ptr() + target * token_bytes)
+                sizes.append(token_bytes)
+        self._mooncake_copy(srcs, dsts, sizes, (self.mooncake_pool,))
 
     def _warmup_external_lru_planner_threads(self) -> int:
         if not (self.use_fused_overlap and self.tp_rank == 0):
@@ -678,10 +1319,44 @@ class SparseKVOffloadManager:
             return self.fused_overlap_membership_map
 
         shape = [row_capacity, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT]
+        if self.is_mooncake:
+            if row_capacity > self.max_num_topk_rows:
+                raise ValueError("Mooncake overlap membership exceeds its planned DRAM capacity")
+            from mooncake.shared_segment import create_shared_segment
+
+            segment = create_shared_segment(
+                "vllm_sparse_membership",
+                {"membership": dict(count=1, shape=shape, dtype=torch.int16)},
+                world_size=self.tp_size, rank_id=self.tp_rank,
+                device_id=torch_npu.npu.current_device(), comm_group=self.tp_group if self.tp_size > 1 else None,
+                mmap=False,
+            )
+            membership_map = None
+            error = None
+            try:
+                if segment.base_addr() != segment.device_addr():
+                    raise ValueError("Mooncake overlap membership requires equal Host/device addresses")
+                membership_map = segment.host_tensors("membership")[0]
+                if self.tp_rank == 0:
+                    membership_map.fill_(-1)
+                    control = membership_map[:, FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT:]
+                    control[:, 1] = FSA_EXTERNAL_PLAN_READY_MARKER
+                    control[:, 2] = self.topk
+                    control[:, 3] = FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_CNT - self.topk
+                    control[:, 7] = FSA_PAIRED_SELECTION_COPY_MARKER
+            except BaseException as exception:
+                error = exception
+            self._mooncake_check_phase(error, "overlap membership mapping")
+            self.tp_group.barrier()
+            membership_map._mooncake_segment = segment
+            self.fused_overlap_membership_map = membership_map
+            self.fused_overlap_membership_map_rows = row_capacity
+            self.mooncake_membership_segment = segment
+            return membership_map
         owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
         membership_map = None
         if self.tp_rank == 0:
-            membership_map = offload.empty(
+            membership_map = _legacy_offload().empty(
                 [row_capacity * FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT],
                 dtype=torch.int16,
                 pin_memory=True,
@@ -734,7 +1409,58 @@ class SparseKVOffloadManager:
         self,
         kv_caches: dict[str, torch.Tensor],
     ):
+        if self.is_mooncake and self.tp_size > 1:
+            error = ""
+            signature = None
+            try:
+                signature = tuple(
+                    (name, tuple((tuple(t.shape), str(t.dtype)) if t is not None else None
+                                 for t in self._as_cache_tuple(caches)))
+                    for name, caches in kv_caches.items()
+                )
+            except Exception as exception:
+                error = str(exception)
+            signatures = [None] * self.tp_size
+            dist.all_gather_object(signatures, (error, signature), group=self.tp_group.cpu_group)
+            if any(item[0] or item[1] != signatures[0][1] for item in signatures):
+                raise ValueError("Mooncake TP ranks disagree on KV layer shapes/order/dtypes")
         self._register_offload_layers(kv_caches)
+        if self.is_mooncake:
+            self._mooncake_store_main_hbm = {
+                name: self._as_cache_tuple(kv_caches[name])[:2] for name in self.offload_layer_names
+            }
+            self._mooncake_store_sidecars = []
+            self._mooncake_store_nonreplicated_sidecars = []
+            self._mooncake_store_main_group = None
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                for name in group.layer_names:
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        spec = spec.kv_cache_specs[name]
+                    if name in self.offload_layer_names:
+                        if self._mooncake_store_main_group not in (None, group_id):
+                            raise ValueError("Sparse Store main layers must share a block group")
+                        self._mooncake_store_main_group = group_id
+                    elif name in kv_caches:
+                        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+                        context = self.vllm_config.compilation_config.static_forward_context
+                        if not isinstance(context.get(name), DeepseekV32IndexerCache):
+                            self._mooncake_store_nonreplicated_sidecars.append(name)
+                        if spec.block_size != self.block_size:
+                            raise ValueError("Sparse Store sidecar token block sizes must match MLA")
+                        for component_id, tensor in enumerate(self._as_cache_tuple(kv_caches[name])):
+                            if tensor is None or not tensor.is_contiguous():
+                                raise ValueError("Sparse Store requires contiguous complete device sidecars")
+                            raw = tensor.view(torch.uint8).reshape(-1)
+                            if raw.numel() % self.kv_cache_config.num_blocks:
+                                raise ValueError("Sparse Store sidecar bytes do not form complete framework pages")
+                            page_bytes = raw.numel() // self.kv_cache_config.num_blocks
+                            self._mooncake_store_sidecars.append(
+                                (group_id, name, component_id, str(tensor.dtype), page_bytes,
+                                 raw.view(self.kv_cache_config.num_blocks, page_bytes))
+                            )
+            self._mooncake_store_sidecar_pool = None
+
 
         # register topk_buffer and cpu kv_cache
         self.topk_buffers_k: list[torch.Tensor] = []
@@ -751,7 +1477,7 @@ class SparseKVOffloadManager:
                 )
             self.topk_buffers_k.append(cache_or_caches[OFFLOAD_TOPK_BUFFER_K_INDEX])
             self.topk_buffers_v.append(cache_or_caches[OFFLOAD_TOPK_BUFFER_V_INDEX])
-            if self.tp_rank == 0:
+            if self.tp_rank == 0 or self.is_mooncake:
                 self.k_caches_cpu.append(cache_or_caches[OFFLOAD_K_CACHE_CPU_INDEX])
                 self.v_caches_cpu.append(cache_or_caches[OFFLOAD_V_CACHE_CPU_INDEX])
 
@@ -794,6 +1520,28 @@ class SparseKVOffloadManager:
             self.current_kv_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.d2h_size_npu = torch.empty(1, dtype=torch.int32, device=device)
         self.d2h_token_indices_npu = torch.arange(self.max_num_tokens, dtype=torch.int64, device=device)
+
+        if self.is_mooncake:
+            self.gvas_k_bases = [view.data_ptr() for view in self.k_caches_cpu]
+            self.gvas_v_bases = [view.data_ptr() for view in self.v_caches_cpu]
+            self.cpu_block_lens = [
+                (k.numel() * k.element_size() // self.kv_cache_config.num_blocks,
+                 v.numel() * v.element_size() // self.kv_cache_config.num_blocks)
+                for k, v in zip(self.k_caches_cpu, self.v_caches_cpu)
+            ]
+            if self.use_fused_copy_sfa:
+                self._bind_copy_sfa_bases()
+            if self.use_fused_overlap:
+                self._init_fused_overlap_planner()
+            if self.mooncake_device_execution:
+                self.mooncake_status = torch.zeros((self.num_layers, 2, 1), dtype=torch.int32, device=device)
+                h2d_capacity = 4 * (self.max_num_reqs + 2)
+                self.mooncake_h2d_src = torch.empty(h2d_capacity, dtype=torch.int64, device=device)
+                self.mooncake_h2d_dst = torch.empty_like(self.mooncake_h2d_src)
+                self.mooncake_h2d_lengths = torch.empty_like(self.mooncake_h2d_src)
+                self.mooncake_h2d_count = torch.zeros(1, dtype=torch.int32, device=device)
+                self.warmup_mooncake_native_copy()
+            return
 
         # Broadcast the shared host KV pool bases and shapes.
         self.gvas_k_bases: list[int] = []
@@ -1082,10 +1830,10 @@ class SparseKVOffloadManager:
             dst_offsets = (slot * stride_tokens + dst_block_tokens.view(1, -1).expand(2, -1)) * token_bytes
             lengths_bytes = lengths.view(1, -1).expand(2, -1) * token_bytes
             count = torch.full((1,), 2 * nblocks, dtype=torch.int32, device=topk_k.device)
-            for host_bases, device_bases in zip(self.copy_sfa_host_bases, self.copy_sfa_device_bases):
+            for layer_id, (host_bases, device_bases) in enumerate(zip(self.copy_sfa_host_bases, self.copy_sfa_device_bases)):
                 sources = (src_offsets + host_bases).reshape(-1)
                 destinations = (dst_offsets + device_bases).reshape(-1)
-                self.copy_sfa_kv(sources, destinations, lengths_bytes.reshape(-1), count)
+                self.copy_sfa_kv(sources, destinations, lengths_bytes.reshape(-1), count, layer_id=layer_id)
 
     def restore_copy_sfa_tails(self, metadata) -> None:
         """Copy the current tail descriptors for every layer. Used on prefix rollback."""
@@ -1098,14 +1846,72 @@ class SparseKVOffloadManager:
         if not getattr(self, "copy_sfa_host_bases", None):
             raise RuntimeError("fused_copy_sfa KV base addresses must be bound before tail restore")
         n = src_off.numel()
-        for host_bases, device_bases in zip(self.copy_sfa_host_bases, self.copy_sfa_device_bases):
+        for layer_id, (host_bases, device_bases) in enumerate(zip(self.copy_sfa_host_bases, self.copy_sfa_device_bases)):
             torch.add(src_off.view(2, -1), host_bases, out=self.copy_sfa_copy_src[:n].view(2, -1))
             torch.add(dst_off.view(2, -1), device_bases, out=self.copy_sfa_copy_dst[:n].view(2, -1))
-            self.copy_sfa_kv(self.copy_sfa_copy_src[:n], self.copy_sfa_copy_dst[:n], lengths, count)
+            self.copy_sfa_kv(self.copy_sfa_copy_src[:n], self.copy_sfa_copy_dst[:n], lengths, count, layer_id=layer_id)
 
-    def copy_sfa_kv(self, sources, destinations, lengths, count) -> None:
+    def copy_sfa_kv(self, sources, destinations, lengths, count, *, layer_id: int | None = None) -> None:
         """Enqueue bounded descriptor copies on the current compute stream."""
-        result = offload.sparse_copy(sources, destinations, lengths, count, sources.device)
+        if getattr(self, "mooncake_device_execution", False):
+            if layer_id is None:
+                raise ValueError("Mooncake native H2D requires its layer status slot")
+            capacity = self.mooncake_h2d_src.numel()
+            number = sources.numel()
+            status = self.mooncake_status[layer_id, 1]
+            if number > capacity:
+                if torch.npu.is_current_stream_capturing():
+                    raise ValueError("Mooncake captured H2D capacity exceeds its prewarmed descriptor arena")
+                self._mooncake_native_copy(sources, destinations, lengths, count, status, reset_status=False)
+                self.check_mooncake_status()
+                return
+            self.mooncake_h2d_src[:number].copy_(sources.reshape(-1))
+            self.mooncake_h2d_dst[:number].copy_(destinations.reshape(-1))
+            self.mooncake_h2d_lengths[:number].copy_(lengths.reshape(-1))
+            torch.bitwise_or(status, torch.any((count < 0) | (count > number)).to(torch.int32).reshape(1) * 8, out=status)
+            self.mooncake_h2d_count.copy_(count.clamp(0, number))
+            with self.mooncake_metrics.measure("native_h2d", device=True):
+                self._mooncake_native_copy(
+                    self.mooncake_h2d_src, self.mooncake_h2d_dst, self.mooncake_h2d_lengths,
+                    self.mooncake_h2d_count, status, reset_status=False,
+                )
+            return
+        if getattr(self, "is_mooncake", False):
+            number = int(count.reshape(-1)[0].item())
+            if number < 0 or number > min(sources.numel(), destinations.numel(), lengths.numel()):
+                raise ValueError("Mooncake H2D descriptor count exceeds capacity")
+            srcs = sources.reshape(-1)[:number].cpu().tolist()
+            dsts = destinations.reshape(-1)[:number].cpu().tolist()
+            sizes = lengths.reshape(-1)[:number].cpu().tolist()
+            resolved_sources, resolved_destinations, resolved_sizes = [], [], []
+            target_ranges = []
+            pool_base = self.mooncake_raw.data_ptr()
+            device_buffers = self.topk_buffers_k + self.topk_buffers_v
+            for source, destination, length in zip(srcs, dsts, sizes):
+                if length < 0:
+                    raise ValueError("Mooncake H2D length must be nonnegative")
+                offset = source - pool_base
+                if not any(start <= offset and offset + length <= start + size for start, size in self._mooncake_regions):
+                    raise ValueError("Mooncake H2D source is outside a declared KV region")
+                if not any(
+                    buffer.data_ptr() <= destination
+                    and destination + length <= buffer.data_ptr() + buffer.numel() * buffer.element_size()
+                    for buffer in device_buffers
+                ):
+                    raise ValueError("Mooncake H2D destination is outside a hot buffer")
+                if length == 0:
+                    continue
+                if any(destination < end and start < destination + length for start, end in target_ranges):
+                    raise ValueError("Mooncake H2D destinations overlap")
+                target_ranges.append((destination, destination + length))
+                resolved_sources.append(
+                    self.mooncake_pool.resolve_range("raw", 0, offset, length, address_domain="device").address
+                )
+                resolved_destinations.append(destination)
+                resolved_sizes.append(length)
+            self._mooncake_copy(resolved_sources, resolved_destinations, resolved_sizes, tuple(device_buffers))
+            return
+        result = _legacy_offload().sparse_copy(sources, destinations, lengths, count, sources.device)
         if result not in (None, 0):
             raise RuntimeError(f"memfabric fused_copy_sfa tail H2D failed with result={result}")
 
@@ -1122,6 +1928,52 @@ class SparseKVOffloadManager:
         has_prefill: bool = False,
         capturing: bool = False,
     ) -> None:
+        if getattr(self, "is_mooncake", False):
+            if getattr(self, "mooncake_device_execution", False):
+                if self._closed:
+                    raise RuntimeError("Mooncake sparse pool is closed")
+                layer_id = self._get_offload_layer_id(layer_name)
+                if self.use_fused_overlap and k is not None and v is not None:
+                    self.current_kv_by_layer[layer_id] = (k, v)
+                error = None
+                try:
+                    self._offload_new_kv_on_current_stream(
+                        slot_mapping, k_cache_cpu, v_cache_cpu, k_cache_npu, v_cache_npu,
+                        k, v, has_prefill, capturing=capturing, layer_id=layer_id,
+                    )
+                    if self.tp_size > 1:
+                        torch_npu.npu.current_stream().synchronize()
+                        if bool(torch.any(self.mooncake_status[layer_id, 0] != 0).item()):
+                            raise RuntimeError("Mooncake TP native writeback rejected a descriptor")
+                except BaseException as exception:
+                    error = exception
+                if self.tp_size > 1:
+                    self._mooncake_check_phase(error, "native writeback")
+                elif error is not None:
+                    raise error
+                return
+            if capturing:
+                raise RuntimeError("Mooncake eager writeback cannot execute inside graph capture/replay")
+            error = None
+            if self.tp_rank == 0:
+                try:
+                    self._mooncake_writeback(
+                        slot_mapping, k_cache_cpu, v_cache_cpu, k_cache_npu, v_cache_npu, k, v, has_prefill
+                    )
+                except BaseException as exception:
+                    error = exception
+            if self.tp_size > 1:
+                # The writer synchronizes its NPU stream before publishing this
+                # completion. Peers cannot reload a partly written DDR row.
+                errors = [None] * self.tp_size
+                dist.all_gather_object(
+                    errors, str(error) if error is not None else None, group=self.tp_group.cpu_group
+                )
+                if any(item is not None for item in errors):
+                    raise RuntimeError(f"Mooncake TP0 writeback failed; all ranks must stop: {errors}") from error
+            elif error is not None:
+                raise error
+            return
         if not has_prefill and k is not None and v is not None and self.use_fused_overlap:
             layer_id = self._get_offload_layer_id(layer_name)
             self.current_kv_by_layer[layer_id] = (k, v)
@@ -1153,6 +2005,45 @@ class SparseKVOffloadManager:
                 has_prefill,
             )
 
+    def _mooncake_writeback(
+        self, slot_mapping, k_cpu, v_cpu, k_npu, v_npu, k, v, has_prefill
+    ) -> None:
+        if k_cpu is None or v_cpu is None:
+            raise RuntimeError("Mooncake Host KV views are not registered")
+        if has_prefill and not self.sparse_kv_offload_config.keep_device_kv_cache:
+            raise RuntimeError("Mooncake colocated prefill requires device KV staging")
+        if slot_mapping.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Mooncake slot_mapping must contain integer slots")
+        slots = slot_mapping.reshape(-1).cpu().tolist()
+        valid_slots = [slot for slot in slots if slot >= 0]
+        if len(set(valid_slots)) != len(valid_slots):
+            raise ValueError("Mooncake writeback has overlapping destination slots")
+        sources, destinations, lengths, owners = [], [], [], []
+        for host, paged, current, token_bytes in (
+            (k_cpu, k_npu, k, self.token_size_bytes_k),
+            (v_cpu, v_npu, v, self.token_size_bytes_v),
+        ):
+            if not host.is_contiguous() or token_bytes <= 0:
+                raise ValueError("Mooncake writeback requires contiguous row-addressable Host KV")
+            source = paged if has_prefill else current
+            if source is None or source.dtype != torch.bfloat16 or source.device.type != "npu":
+                raise ValueError("Mooncake writeback requires BF16 current/paged KV")
+            rows = source.contiguous().view(-1, token_bytes // source.element_size())
+            owners.append(rows)
+            if not has_prefill and rows.shape[0] != len(slots):
+                raise ValueError("Mooncake current KV row count differs from slot_mapping")
+            capacity = host.numel() * host.element_size() // token_bytes
+            for row, slot in enumerate(slots):
+                if slot < 0:
+                    continue
+                source_row = slot if has_prefill else row
+                if slot >= capacity or source_row >= rows.shape[0]:
+                    raise ValueError("Mooncake writeback slot is outside its KV allocation")
+                sources.append(rows[source_row].data_ptr())
+                destinations.append(self._mooncake_device_address(host, slot * token_bytes, token_bytes))
+                lengths.append(token_bytes)
+        self._mooncake_copy(sources, destinations, lengths, tuple(owners))
+
     def _offload_new_kv_on_current_stream(
         self,
         slot_mapping: torch.Tensor,
@@ -1164,6 +2055,7 @@ class SparseKVOffloadManager:
         v: torch.Tensor | None,  # decode: k/v -> cache_cpu[slot]
         has_prefill: bool = False,
         capturing: bool = False,
+        layer_id: int | None = None,
     ) -> None:
         # the has_prefill path (NPU paged cache -> CPU pool D2H) only exists
         # for single-node PD-colocate debug.
@@ -1206,6 +2098,12 @@ class SparseKVOffloadManager:
             )
         valid = (slots >= 0) & (slots < num_k_slots)
         safe_slots = slots.clamp(min=0, max=num_k_slots - 1)
+        duplicate = None
+        if getattr(self, "mooncake_device_execution", False):
+            sorted_slots = torch.sort(slots).values
+            duplicate = torch.any((sorted_slots[1:] == sorted_slots[:-1]) & (sorted_slots[1:] >= 0))
+            # Reject the whole batch before any concurrent duplicate writes.
+            valid = valid & ~duplicate
 
         if has_prefill:
             assert k_cache_npu is not None and v_cache_npu is not None
@@ -1237,7 +2135,19 @@ class SparseKVOffloadManager:
         self.d2h_lengths_npu[token_count : 2 * token_count].masked_fill_(~valid, 0)
         self.d2h_size_npu.fill_(2 * token_count)
 
-        result = offload.sparse_copy(
+        if getattr(self, "mooncake_device_execution", False):
+            if layer_id is None:
+                raise ValueError("Mooncake native writeback requires a stable layer status slot")
+            status = self.mooncake_status[layer_id, 0]
+            torch.bitwise_or(status, torch.any(slots >= num_k_slots).to(torch.int32).reshape(1) * 4, out=status)
+            torch.bitwise_or(status, duplicate.to(torch.int32).reshape(1) * 16, out=status)
+            with self.mooncake_metrics.measure("native_d2h", device=True):
+                self._mooncake_native_copy(
+                    self.d2h_src_ptrs_npu, self.d2h_dst_ptrs_npu, self.d2h_lengths_npu,
+                    self.d2h_size_npu, status, reset_status=False,
+                )
+            return
+        result = _legacy_offload().sparse_copy(
             self.d2h_src_ptrs_npu,
             self.d2h_dst_ptrs_npu,
             self.d2h_lengths_npu,

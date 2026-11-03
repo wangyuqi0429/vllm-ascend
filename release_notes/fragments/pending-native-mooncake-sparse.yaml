@@ -1,0 +1,8 @@
+# Local development draft: replace null with the actual PR number and rename
+# this file to <PR number>.yaml before opening a PR. No PR has been created.
+pr: null
+entries:
+  - category: feature
+    text: Added an experimental native Mooncake backend for single-rank eager BF16 MLA sparse KV offload, reusing shared memory and the existing LIM selection policy without MemFabric dependencies.
+  - category: config
+    text: Added sparse offload backend and Mooncake memory-mode selection. The default backend remains unchanged; colocated prefill currently retains its device KV cache.

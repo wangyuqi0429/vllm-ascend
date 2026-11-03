@@ -31,12 +31,17 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     DSPARK_DRAFT_KV_ACK,
     MF_META,
     MF_META_ACK,
+    MOONCAKE_PD_ADDRESS_ABI,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
     SFAPD_PROTOCOL_VERSION,
     CopySfaTailDest,
     DSparkDraftKVStatus,
+)
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_sparse_transfer import (
+    MooncakeCompletionUnknown,
+    MooncakeSparseTransfer,
 )
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
@@ -136,6 +141,7 @@ class MembPullReadThread(threading.Thread):
         self._host = get_ip()
         self._stop_event = threading.Event()
         self.startup_error: BaseException | None = None
+        self.completion_unknown_error: BaseException | None = None
 
     def bind_dspark_context_receiver(self, receiver: DSparkContextReceiver) -> None:
         self._state.dspark_context_receiver = receiver
@@ -221,6 +227,12 @@ class MembPullReadThread(threading.Thread):
                         if not isinstance(p_session, str):
                             raise ValueError("MF_META session must be a string")
                         p_layer_meta = msgspec.msgpack.decode(msg[2])
+                        strict = isinstance(self.engine, MooncakeSparseTransfer)
+                        for layer in p_layer_meta.values():
+                            advertised = layer.get("address_abi", "memfabric")
+                            expected = MOONCAKE_PD_ADDRESS_ABI if strict else "memfabric"
+                            if advertised != expected:
+                                raise ValueError("SFA PD peers disagree on transfer backend/address domain")
                         unknown_layers = set(p_layer_meta) - set(self._state.layer_metadata)
                         if unknown_layers:
                             raise ValueError(f"MF_META contains layers unknown to D: {sorted(unknown_layers)}")
@@ -255,7 +267,11 @@ class MembPullReadThread(threading.Thread):
                         if len(msg) == 3:
                             sock.send_multipart((identity, b"", b"ACK"))
                         else:
-                            sock.send_multipart((identity, b"", encoder.encode((MF_META_ACK, SFAPD_PROTOCOL_VERSION))))
+                            reply = (
+                                (MF_META_ACK, SFAPD_PROTOCOL_VERSION, MOONCAKE_PD_ADDRESS_ABI)
+                                if strict else (MF_META_ACK, SFAPD_PROTOCOL_VERSION)
+                            )
+                            sock.send_multipart((identity, b"", encoder.encode(reply)))
 
                     elif msg_type == DSPARK_DRAFT_KV:
                         self._handle_dspark_draft_kv(identity, msg, sock, encoder)
@@ -320,6 +336,11 @@ class MembPullReadThread(threading.Thread):
                                 len(read_reqs),
                                 len(done_ext_ids),
                             )
+                        except MooncakeCompletionUnknown as error:
+                            # No ACK, terminal notification or allocator release:
+                            # model-side polling must fail the whole instance.
+                            self.completion_unknown_error = error
+                            logger.error("Mooncake read completion is unknown; quarantining request storage")
                         except Exception as e:
                             logger.error(
                                 "MembPull batch read failed for layer %d (%s), reqs=%d: %s",

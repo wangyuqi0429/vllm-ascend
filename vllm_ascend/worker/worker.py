@@ -452,11 +452,16 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
+        sparse_manager = getattr(getattr(self, "model_runner", None), "sparse_kv_offload_manager", None)
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
         if isinstance(state, AscendEplbState):
             state.close()
+        if sparse_manager is not None:
+            sparse_manager.assert_mooncake_store_shutdown_safe()
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
+        if sparse_manager is not None:
+            sparse_manager.close()
         if ensure_ec_transfer_shutdown is not None:
             ensure_ec_transfer_shutdown()
 
@@ -627,6 +632,18 @@ class NPUWorker(WorkerBase):
 
         kv_cache_spec = getattr(self, "kv_cache_spec", None) or self.get_kv_cache_spec()
         dram_limit_bytes = int(sparse_kv_offload_config.dram_size_per_dp_GB * GiB_bytes)
+        if sparse_kv_offload_config.backend == "mooncake":
+            # One complete device-sidecar page per layer/component is reserved
+            # for Store staging before the framework chooses physical blocks.
+            # 2MiB covers the separately aligned SharedSegment allocation.
+            store_staging_reserve = sum(
+                spec.page_size_bytes for spec in kv_cache_spec.values()
+                if not getattr(spec, "store_on_host", False)
+            ) + (2 << 20)
+            dram_limit_bytes -= store_staging_reserve
+            if dram_limit_bytes <= 0:
+                raise ValueError("Mooncake DRAM budget cannot reserve Store sidecar staging")
+
         budget = plan_sparse_kv_offload_memory(
             kv_cache_spec=kv_cache_spec,
             vllm_config=self.vllm_config,
@@ -1335,10 +1352,21 @@ class NPUWorker(WorkerBase):
         # Restrict the discardable kv_cache pool to backing cache allocations.
         # Persistent metadata created during initialize_kv_cache must stay
         # outside this pool so sleep/wake does not drop its contents.
-        self.model_runner.initialize_kv_cache(
-            kv_cache_config,
-            kv_cache_allocation_context=self._maybe_get_memory_pool_context(tag="kv_cache"),
-        )
+        try:
+            self.model_runner.initialize_kv_cache(
+                kv_cache_config,
+                kv_cache_allocation_context=self._maybe_get_memory_pool_context(tag="kv_cache"),
+            )
+        except BaseException:
+            manager = getattr(self.model_runner, "sparse_kv_offload_manager", None)
+            if manager is not None:
+                manager.assert_mooncake_store_shutdown_safe()
+            if ensure_kv_transfer_shutdown is not None:
+                ensure_kv_transfer_shutdown()
+            manager = getattr(self.model_runner, "sparse_kv_offload_manager", None)
+            if manager is not None:
+                manager.close()
+            raise
 
         # MRV2's scheduler emits new_block_ids_to_zero whenever this flag is
         # set, so its worker-side consumer must use the same condition. Keep the

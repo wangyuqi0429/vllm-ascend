@@ -27,6 +27,7 @@ DSPARK_DRAFT_KV_ACK = b"dspark_draft_kv_ack"
 # producers with PP>1 require the structured acknowledgement below.
 SFAPD_PROTOCOL_VERSION = 1
 MF_META_ACK = b"mf_meta_ack"
+MOONCAKE_PD_ADDRESS_ABI = "mooncake-device-v1"
 
 
 class DSparkDraftKVStatus(Enum):

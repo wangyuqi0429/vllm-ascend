@@ -1034,6 +1034,10 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_block_copies=[],
             )
         sampling_metadata = super()._update_states(scheduler_output)
+        sparse_store_manager = getattr(self, "sparse_kv_offload_manager", None)
+        if sparse_store_manager is not None:
+            sparse_store_manager.process_mooncake_store_metadata(scheduler_output)
+
         self._track_tmp_encoder_cache_refs(scheduler_output)
         return sampling_metadata
 
@@ -3554,6 +3558,11 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 )
         run_model = partial(self.model, **model_inputs)
+        sparse_manager = getattr(self, "sparse_kv_offload_manager", None)
+        if sparse_manager is not None:
+            sparse_manager.prepare_mooncake_step()
+            if getattr(sparse_manager, "is_mooncake", False):
+                run_model = partial(sparse_manager.run_mooncake_forward, run_model)
 
         try:
             if self.decoder_replay is not None:
@@ -3573,6 +3582,8 @@ class NPUModelRunner(GPUModelRunner):
             if executor is not None and executor.submission_in_flight:
                 executor.release()
 
+        if sparse_manager is not None:
+            sparse_manager.check_mooncake_status()
         return hidden_states
 
     def _prepare_device_metadata_for_forward(
@@ -5691,6 +5702,7 @@ class NPUModelRunner(GPUModelRunner):
                                         self.tp_rank,
                                         self.sparse_kv_offload_config.keep_device_kv_cache,
                                         self._allocate_int8_cache_tensor,
+                                        layer_name=layer_name_inner,
                                     )
                                 )
                         continue
@@ -6938,6 +6950,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""
+        sparse_manager = getattr(self, "sparse_kv_offload_manager", None)
+        if sparse_manager is not None:
+            resources = sparse_manager.retain_mooncake_graph_resources()
+            self._mooncake_graph_resources = resources
+            if resources:
+                self.model._mooncake_graph_resources = resources
         parent_module_name = _get_gpu_model_runner_module_name(self)
         self._engram_capture_active = True
         try:

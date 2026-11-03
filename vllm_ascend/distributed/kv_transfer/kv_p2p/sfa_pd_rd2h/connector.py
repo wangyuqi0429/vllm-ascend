@@ -270,7 +270,7 @@ class SfaRemoteD2HConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self):
         # Decode KV writes are synchronized by SparseKVOffloadManager. P-side
         # completion is tracked by READ_DONE/storage_send_done_events.
-        if self.is_consumer and self.connector_worker is not None:
+        if self.connector_worker is not None and hasattr(self.connector_worker, "wait_for_save"):
             self.connector_worker.wait_for_save()
 
     def get_copy_sfa_slot_bindings(self) -> dict[str, int]:

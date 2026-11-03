@@ -23,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     DSPARK_DRAFT_KV_ACK,
     MF_META,
     MF_META_ACK,
+    MOONCAKE_PD_ADDRESS_ABI,
     READ_DONE,
     READ_FAILED,
     READ_READY_BATCH,
@@ -47,6 +48,7 @@ class ProducerSendState:
     layer_storage_slots: dict[int, tuple[int, ...]]
     producer_pp_rank: int = 0
     producer_pp_size: int = 1
+    strict_completion: bool = False
 
 
 @dataclass
@@ -105,6 +107,7 @@ class MembPullSendingThread(threading.Thread):
             event.set()
             self.storage_send_done_events.append(event)
         self._storage_read_errors: dict[int, str] = {}
+        self.quarantined_error: str | None = None
         # Per-layer fresh compute-stream events recorded by the producer in
         # save_kv_layer right after KV scatter.
         self._p_save_events: dict[int, Any] = {}
@@ -213,6 +216,9 @@ class MembPullSendingThread(threading.Thread):
             )
             for layer_idx in list(self._pending_reads_by_layer):
                 self._record_layer_error(layer_idx, pending_error)
+                if self._state.strict_completion:
+                    self.quarantined_error = pending_error
+                    continue
                 self._pending_reads_by_layer.pop(layer_idx, None)
                 self._signal_layer_done(layer_idx)
             while True:
@@ -471,6 +477,7 @@ class MembPullSendingThread(threading.Thread):
                 "tensor_group_idx": list(meta.tensor_group_idx),
                 "main_tensor_count": meta.main_tensor_count,
                 "has_indexer": meta.has_indexer,
+                "address_abi": MOONCAKE_PD_ADDRESS_ABI if self._state.strict_completion else "memfabric",
             }
         dealer.send(
             encoder.encode(
@@ -488,11 +495,15 @@ class MembPullSendingThread(threading.Thread):
             frames = dealer.recv_multipart()
             payload = [f for f in frames if f != b""]
             if payload == [b"ACK"]:
-                if self._state.producer_pp_size > 1:
+                if self._state.producer_pp_size > 1 or self._state.strict_completion:
                     raise RuntimeError("SFAPD producer PP>1 requires a PP-aware D; received a legacy MF_META ACK")
             elif len(payload) == 1:
                 reply = msgspec.msgpack.Decoder(type=tuple).decode(payload[0])
-                if reply != (MF_META_ACK, SFAPD_PROTOCOL_VERSION):
+                expected = (
+                    (MF_META_ACK, SFAPD_PROTOCOL_VERSION, MOONCAKE_PD_ADDRESS_ABI)
+                    if self._state.strict_completion else (MF_META_ACK, SFAPD_PROTOCOL_VERSION)
+                )
+                if reply != expected:
                     raise RuntimeError(f"MembPull P MF_META got unexpected reply: {reply!r}")
             else:
                 raise RuntimeError(f"MembPull P MF_META got unexpected reply: {payload!r}")
@@ -558,6 +569,11 @@ class MembPullSendingThread(threading.Thread):
         logger.debug("MembPull P layer send complete: layer=%d", layer_idx)
 
     def _fail_layer(self, layer_idx: int, error: str) -> None:
+        if self._state.strict_completion:
+            # A control-plane error is not a drained DMA acknowledgement.
+            self.quarantined_error = error
+            self._record_layer_error(layer_idx, error)
+            return
         self._pending_reads_by_layer.pop(layer_idx, None)
         self._pending_read_paths_by_layer.pop(layer_idx, None)
         self._record_layer_error(layer_idx, error)

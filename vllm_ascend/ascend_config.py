@@ -1649,6 +1649,11 @@ class SparseKVOffloadConfig:
     """
 
     enabled: bool = False
+    backend: Literal["memfabric", "mooncake"] = "memfabric"
+    mooncake_memory_mode: Literal["mmap_registered", "vmm"] = "mmap_registered"
+    mooncake_execution_mode: Literal["eager", "graph"] = "eager"
+    mooncake_attention_mode: Literal["unfused", "fused_copy", "fused_overlap"] = "unfused"
+    mooncake_metrics: bool = False
     # -1 resolves to (1 + num_speculative_tokens) * 2048.
     topk_buffer_size: int = -1
     dram_size_per_dp_GB: int = 110
@@ -1658,11 +1663,25 @@ class SparseKVOffloadConfig:
 
     @property
     def use_fused_copy_sfa(self) -> bool:
-        """Use fused LIM + Copy-SFA unless the overlap operator is selected."""
+        """Select the shared LIM/Copy-SFA layout (legacy configuration name).
+
+        Mooncake reuses this metadata and residency policy but executes its own
+        byte copies followed by the existing non-fused SFA operator.
+        """
         return self.enabled and not self.use_fused_overlap
+
+    @property
+    def execute_fused_copy_sfa(self) -> bool:
+        return self.use_fused_copy_sfa and (
+            self.backend != "mooncake" or self.mooncake_attention_mode == "fused_copy"
+        )
 
     @model_validator(mode="after")
     def _validate_values(self):
+        if self.backend == "mooncake":
+            if self.use_fused_overlap and self.mooncake_attention_mode != "fused_overlap":
+                raise ValueError("Select mooncake_attention_mode=fused_overlap for the mapped overlap path")
+            self.use_fused_overlap = self.mooncake_attention_mode == "fused_overlap"
         if self.topk_buffer_size != -1 and self.topk_buffer_size <= 0:
             raise ValueError("sparse_kv_offload_config.topk_buffer_size must be -1 or positive")
         if self.dram_size_per_dp_GB <= 0:
@@ -1686,6 +1705,29 @@ class SparseKVOffloadConfig:
     def _validate_preconditions(self, vllm_config: VllmConfig) -> None:
         if not self.enabled:
             return
+
+        if self.backend == "mooncake":
+            parallel = vllm_config.parallel_config
+            if self.mooncake_execution_mode == "eager" and not vllm_config.model_config.enforce_eager:
+                raise ValueError("Mooncake sparse offload currently requires enforce_eager=True")
+            if self.mooncake_execution_mode == "graph":
+                if parallel.tensor_parallel_size != 1:
+                    raise ValueError("Mooncake graph execution currently requires a single TP rank")
+                if self.mooncake_attention_mode == "unfused":
+                    raise ValueError("Mooncake graph execution requires fused_copy or fused_overlap attention")
+            if self.mooncake_attention_mode != "unfused" and self.mooncake_memory_mode != "vmm":
+                raise ValueError("Mooncake fused attention requires VMM with equal Host/device addresses")
+            if vllm_config.speculative_config is not None:
+                raise ValueError("Mooncake sparse eager does not yet support speculative decoding")
+            transfer = vllm_config.kv_transfer_config
+            if transfer is not None:
+                extra = transfer.kv_connector_extra_config or {}
+                if extra.get("transfer_backend") != "mooncake":
+                    raise ValueError("Mooncake sparse PD requires transfer_backend=mooncake on both P and D")
+            if not self.keep_device_kv_cache and (transfer is None or not transfer.is_kv_consumer):
+                raise ValueError("Mooncake colocated prefill currently requires keep_device_kv_cache=True")
+            if getattr(vllm_config.model_config.hf_text_config, "qk_rope_head_dim", 0) <= 0:
+                raise ValueError("Mooncake sparse eager currently requires BF16 MLA with a RoPE KV component")
 
         if is_950():
             raise ValueError("Sparse KV offload is not supported on 950PR&950DT Products")

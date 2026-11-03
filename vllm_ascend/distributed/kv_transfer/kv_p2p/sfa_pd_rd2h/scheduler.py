@@ -299,6 +299,7 @@ class SFAPDRD2HScheduler:
         # can build request_map for get_finished even while async-waiting KV).
         self._reqs_need_recv: set[str] = set()
         self._dspark_pending_recv: set[str] = set()
+        self._mooncake_pending_recv: set[str] = set()
         self._deferred_finished_req_ids: set[str] = set()
         self.executor = ThreadPoolExecutor(32)
         self._metaserver_futures = {}
@@ -390,6 +391,8 @@ class SFAPDRD2HScheduler:
         main_block_ids = list(block_ids_by_group[self.main_group_idx])
         indexer_block_ids = list(block_ids_by_group[self.indexer_group_idx])
         self._request_trackers[request.request_id] = (main_block_ids, indexer_block_ids)
+        if (self.vllm_config.kv_transfer_config.kv_connector_extra_config or {}).get("transfer_backend") == "mooncake":
+            self._mooncake_pending_recv.add(request.request_id)
         dspark_context_descriptor = None
         dspark_draft_block_ids_by_group = None
         if getattr(self, "_dspark_context_groups", ()):
@@ -523,7 +526,7 @@ class SFAPDRD2HScheduler:
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        if request.request_id in self._dspark_pending_recv:
+        if request.request_id in self._dspark_pending_recv or request.request_id in getattr(self, "_mooncake_pending_recv", ()):
             # Let the existing rendezvous and reads drain naturally. vLLM
             # retains the KV blocks; retain the connector's destinations too.
             self._deferred_finished_req_ids.add(request.request_id)
@@ -534,6 +537,7 @@ class SFAPDRD2HScheduler:
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         completed = set(connector_output.finished_recving or ())
         self._dspark_pending_recv.difference_update(completed)
+        getattr(self, "_mooncake_pending_recv", set()).difference_update(completed)
         for request_id in completed & self._deferred_finished_req_ids:
             self._cleanup_finished_request(request_id)
 
@@ -543,6 +547,7 @@ class SFAPDRD2HScheduler:
         getattr(self, "_dspark_context_requests", {}).pop(request_id, None)
         self._reqs_need_recv.discard(request_id)
         self._dspark_pending_recv.discard(request_id)
+        getattr(self, "_mooncake_pending_recv", set()).discard(request_id)
         self._deferred_finished_req_ids.discard(request_id)
         copy_sfa_bindings = getattr(self, "_copy_sfa_bindings", None)
         if copy_sfa_bindings is not None:

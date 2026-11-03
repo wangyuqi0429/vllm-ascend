@@ -382,6 +382,7 @@ class MooncakeBackend(Backend):
         lazy_init: bool = False,
         contribute_memory: bool = True,
         extra_config: dict[str, Any] | None = None,
+        dedicated_transfer_engine: bool = False,
     ):
         self.parallel_config = parallel_config
         self.config = MooncakeStoreConfig.load_from_env()
@@ -397,7 +398,9 @@ class MooncakeBackend(Backend):
         # ASCEND_GLOBAL_RESOURCE_CONFIG: dual-protocol / RoCE Store path where the store
         # operates independently of the global transfer engine; setup goes through store
         # and buffers are registered via store.register_buffer() instead of global_te.
-        self._use_store_independent_te = bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG")) and not self._use_fabric_mem
+        self._use_store_independent_te = dedicated_transfer_engine or (
+            bool(os.getenv("ASCEND_GLOBAL_RESOURCE_CONFIG")) and not self._use_fabric_mem
+        )
         self._lazy_init = lazy_init and self._use_fabric_mem
         self._contribute_memory = contribute_memory
         self._store_initialized = False
