@@ -13,11 +13,13 @@ from unittest.mock import Mock
 
 import msgspec
 import pytest
+import torch
 from zmq.constants import SocketOption, SocketType
 from zmq.sugar.context import Context
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker, push_worker
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import MooncakeBaseConnectorWorker
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.dsv41 import DeepseekV41TransferPlan
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePCPTransferMetadata,
@@ -26,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeTransferMetadata,
     MooncakeTransferMetadataGroups,
 )
+from vllm_ascend.models.deepseek_v41.layerwise_cache_access import CacheResource, LayerCacheAccess
 
 
 class Event:
@@ -235,6 +238,160 @@ def test_proxy_destinations_and_two_chunks(worker):
     worker.start_load_kv(terminal)
     results = worker.get_transfer_results()
     assert results.finished_sending == {"p-request"}
+
+
+def configure_dsv41(worker, *, replay=False):
+    name = "model.layers.0.attn"
+    resource = CacheResource(name, 0, 0)
+    access = LayerCacheAccess(0, (resource,), (resource,), None, None)
+    worker._dsv41_plan = DeepseekV41TransferPlan((access,), {name: 4}, {name: 4}, replay)
+    spec = Mock(spec=push_worker.SlidingWindowSpec)
+    spec.sliding_window = 4
+    spec.num_retained_tokens = 3
+    spec.is_circular = False
+    worker.kv_cache_specs = [spec]
+    return name
+
+
+def test_dsv41_generic_fallback_cannot_publish_unwritten_cache(worker):
+    name = configure_dsv41(worker)
+    worker.start_load_kv(source_meta(4, 4))
+    assert not worker._reqs_send_state["d-request"].available_layers
+    worker.save_kv_layer(name)
+    worker.wait_for_save()
+    assert not worker.engine.batch_transfer_sync_write.called
+    assert "not written" in worker._send_done.call_args.args[1]
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_dsv41_empty_cut_only_publishes_proven_writes(worker, monkeypatch, complete):
+    name = configure_dsv41(worker)
+    worker.start_load_kv(source_meta(4, 4))
+    send = Mock()
+    monkeypatch.setattr(worker, "_process_sending_requests", send)
+    slots = torch.tensor([[2, 0], [2, 1], [2, 2], [2, 3 if complete else -1]])
+    worker.on_dsv41_pool_cut_writes(
+        name,
+        {name: SimpleNamespace(num_actual_tokens=4, storage_block_size=4, compress_ratio=1, slot_mapping=slots)},
+    )
+    state = worker._reqs_send_state["d-request"]
+    worker._finish_dsv41_step()
+    if complete:
+        assert state.available_layers[name][0] == 8
+        assert state.error is None
+        send.assert_called_once_with(layer_hook=True)
+    else:
+        assert name not in state.available_layers
+        assert "not written" in state.error
+        send.assert_not_called()
+
+
+def test_dsv41_generic_resources_can_use_normal_push_hooks(worker, monkeypatch):
+    target = configure_dsv41(worker)
+    draft = "draft.layers.0.attn"
+    auxiliary = "draft.layers.1.attn"
+    layer_index = ("draft.layers", 0)
+    worker._layer_index_by_name[draft] = layer_index
+    worker._layer_names_by_index[layer_index] = [draft]
+    worker._layer_indices.update({draft: 1, auxiliary: 2})
+    worker.start_load_kv(source_meta(0, 8))
+    monkeypatch.setattr(worker, "_process_sending_requests", Mock())
+    monkeypatch.setattr(worker, "_send_completions", Mock())
+    state = worker._reqs_send_state["d-request"]
+
+    worker.save_kv_layer(draft)
+    assert set(state.available_layers) == {draft}
+    worker.on_dsv41_cache_written(target, None)
+    worker.wait_for_save()
+
+    assert state.error is None
+    assert set(state.available_layers) == {target, draft, auxiliary}
+
+
+def test_dsv41_explicit_hook_sends_final_window(worker):
+    name = configure_dsv41(worker)
+    worker.start_load_kv(source_meta(0, 8))
+    worker.on_dsv41_cache_written(name, None)
+    assert not worker._send_done.called
+    worker.wait_for_save()
+    assert worker._send_done.call_args.args[1] is None
+    # The last window is in the second source/destination block.
+    assert worker.engine.batch_transfer_sync_write.call_args.args[1:] == ([1064], [10352], [32])
+
+
+def test_dsv41_replay_producer_can_push_to_non_replay_consumer(worker):
+    name = configure_dsv41(worker, replay=True)
+    source = push_worker.AscendSlidingWindowMLASpec(
+        block_size=4, num_kv_heads=1, head_size=2, dtype=torch.bfloat16, sliding_window=4, bounded_replay=True
+    )
+    destination = replace(source, bounded_replay=False)
+    source_signature = worker._dsv41_transfer_spec_signature(name, source)
+    destination_signature = worker._dsv41_transfer_spec_signature(name, destination)
+    worker.transfer_metadata = replace(worker.transfer_metadata, dsv41_layout=(source_signature,))
+    remote = remote_metadata()
+    pp = replace(remote.metadata_by_pp_rank[0], dsv41_layout=(destination_signature,))
+
+    worker._validate_dsv41_remote_layout(replace(remote, metadata_by_pp_rank={0: pp}))
+    assert source.bounded_replay
+    assert name in worker._dsv41_plan.window_groups
+    assert not destination.bounded_replay
+
+    different_window = worker._dsv41_transfer_spec_signature(name, replace(destination, sliding_window=8))
+    pp = replace(pp, dsv41_layout=(different_window,))
+    with pytest.raises(ValueError, match="matching P/D transfer cache plans"):
+        worker._validate_dsv41_remote_layout(replace(remote, metadata_by_pp_rank={0: pp}))
+
+
+@pytest.mark.parametrize("mismatch", ["plan", "tp", "block_size", "shape", "group"])
+def test_dsv41_rejects_incompatible_remote_layout(worker, mismatch):
+    configure_dsv41(worker)
+    worker.transfer_metadata = replace(worker.transfer_metadata, dsv41_layout=("target-layout",))
+    remote = remote_metadata()
+    pp = replace(remote.metadata_by_pp_rank[0], dsv41_layout=worker.transfer_metadata.dsv41_layout)
+    remote = replace(remote, metadata_by_pp_rank={0: pp})
+    worker._validate_dsv41_remote_layout(remote)
+    if mismatch == "plan":
+        pp = replace(pp, dsv41_layout=("different-target-layout",))
+    elif mismatch == "tp":
+        remote = replace(remote, tp_size=2)
+    elif mismatch == "block_size":
+        pp = replace(pp, layer_block_sizes=[8])
+    elif mismatch == "shape":
+        pp = replace(pp, block_shapes=[[(1, 8, 2)]])
+    else:
+        pp = replace(pp, group_indices=[1])
+    remote = replace(remote, metadata_by_pp_rank={0: pp})
+    with pytest.raises(ValueError, match="V4.1 Push"):
+        worker._validate_dsv41_remote_layout(remote)
+
+
+def test_dsv41_missing_destination_swa_cannot_report_success(worker):
+    name = configure_dsv41(worker)
+    target = destination_message()
+    target["block_ids"] = [[10, 0]]
+    worker.start_load_kv(source_meta(0, 8, target=target))
+    worker.on_dsv41_cache_written(name, None)
+    worker.wait_for_save()
+    assert not worker.engine.batch_transfer_sync_write.called
+    assert "not resident" in worker._send_done.call_args.args[1]
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_dsv41_replay_validates_slots_before_success_done(worker, complete):
+    name = configure_dsv41(worker, replay=True)
+    worker.start_load_kv(source_meta(4, 4))
+    slots = torch.tensor([9, 10, 11] if complete else [9, 10])
+    worker.on_dsv41_cache_written(name, slots, cache_only=True)
+    assert not worker._reqs_send_state["d-request"].available_layers
+    assert not worker.engine.batch_transfer_sync_write.called
+    worker.wait_for_save()
+    error = worker._send_done.call_args.args[1]
+    if complete:
+        assert error is None
+        assert worker.engine.batch_transfer_sync_write.called
+    else:
+        assert "Incomplete" in error
+        assert not worker.engine.batch_transfer_sync_write.called
 
 
 def test_partial_block_waits_for_later_chunk(worker):

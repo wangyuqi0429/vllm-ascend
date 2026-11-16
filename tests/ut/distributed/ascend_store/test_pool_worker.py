@@ -1970,6 +1970,164 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
         for layer_tasks in worker.layer_load_tasks:
             self.assertEqual(layer_tasks, [])
 
+    def test_dsv41_private_layer_releases_third_layer_prefetch_without_put(self):
+        worker = self._make_worker()
+        worker.hf_config = SimpleNamespace(model_type="deepseek_v41")
+        worker.block_key_hybrid = worker.use_block_key_layerwise = True
+        worker.kv_role = "kv_both"
+        worker.consumer_is_to_put = False
+        worker.num_layers = 3
+        worker.current_layer = worker.next_layer_to_submit = 0
+        worker.num_prefetch_layers = 2
+        worker.prefetch_layer_map = {}
+        worker.layer_load_finished_events = [threading.Event() for _ in range(3)]
+        worker.layer_load_tasks = [[], [], [object()]]
+        worker.external_slot_release_waiter = None
+        worker.kv_recv_thread = MagicMock()
+        worker._check_hybrid_load_errors = MagicMock()
+        worker._submit_attention_save = MagicMock()
+        worker._recurrent_layers = set()
+
+        with patch.object(torch.npu, "Event"):
+            worker.wait_for_layer_load()
+            task = worker.kv_recv_thread.add_request.call_args.args[0]
+            self.assertEqual(task.layer_id, 2)
+            self.assertFalse(task.attention_start_gate.wait(timeout=0))
+            worker.start_dsv41_pool_attention()
+            self.assertTrue(task.attention_start_gate.wait(timeout=0))
+        worker._submit_attention_save.assert_not_called()
+
+    def test_dsv41_mooncake_layout_tracks_cache_owners_with_or_without_replay(self):
+        worker = self._make_worker()
+        worker.use_block_key_layerwise = True
+        worker.num_layers = 41
+        worker.hf_config = SimpleNamespace(
+            num_hidden_layers=40,
+            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+            kv_source_layer_ids=[2, 8, 14, 20],
+            index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+            candidate_source_layer_id=20,
+            candidate_topk_blocks=2048,
+            candidate_block_size=8,
+            index_topk=512,
+            engram_layer_ids=[1, 14],
+        )
+        prefix = "model.layers.{}.self_attn."
+        owners = worker.hf_config.kv_source_layer_ids
+        groups = [
+            [prefix.format(layer) + "swa_cache" for layer in range(41)],
+            [prefix.format(layer) + suffix for layer in owners for suffix in ("long_kv_cache", "indexer.k_cache")],
+            [prefix.format(layer) + "compressor.state_cache" for layer in owners[:-1]],
+        ]
+        groups[1].append(prefix.format(20) + "indexer.k_cache_folded")
+        worker.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=object()) for names in groups],
+            draft_attn_layer_names=(groups[0][-1],),
+        )
+        worker.num_kv_cache_groups = len(groups)
+        worker.use_layerwise_transfer = False
+        worker._global_to_local_layer = {layer: layer for layer in range(41)}
+        registered = dict.fromkeys(name for group in groups for name in group)
+        for replay in (True, False):
+            with self.subTest(replay=replay):
+                worker.cacheable_group_ids = [1] if replay else [0, 1]
+                worker._init_layerwise_config()
+                worker._register_dsv41_pool_layout(registered)
+                self.assertEqual(worker.dsv41_backbone_end, 40)
+                for layer in range(40):
+                    expected = [] if replay else [0]
+                    if layer in owners:
+                        expected.append(1)
+                    self.assertEqual(
+                        [group_id for group_id, _ in worker._groups_for_layerwise_transfer(layer)], expected
+                    )
+                self.assertEqual(
+                    worker._dsv41_cut_slot_sources[1],
+                    (prefix.format(20) + "indexer.k_cache", prefix.format(20) + "long_kv_cache"),
+                )
+        missing = dict(registered)
+        del missing[prefix.format(20) + "indexer.k_cache_folded"]
+        with self.assertRaisesRegex(ValueError, "unregistered=.*k_cache_folded"):
+            worker._register_dsv41_pool_layout(missing)
+
+        del registered[groups[0].pop()]
+        worker.kv_cache_config.draft_attn_layer_names = ()
+        worker.num_layers = 40
+        worker._init_layerwise_config()
+        worker._register_dsv41_pool_layout(registered)
+        self.assertEqual(worker.dsv41_backbone_end, worker.num_layers)
+
+    def test_dsv41_load_checks_layer_before_waiting(self):
+        worker = self._make_worker()
+        worker.dsv41_backbone_end = 40
+        worker.num_layers = 40
+        worker._global_to_local_layer = {19: 19, 20: 20}
+        worker.current_layer = 19
+        worker.wait_for_layer_load = MagicMock()
+        with self.assertRaisesRegex(RuntimeError, "layer 20.*expects local layer 19"):
+            worker.wait_for_dsv41_layer_load(20)
+        worker.wait_for_layer_load.assert_not_called()
+        self.assertTrue(worker.wait_for_dsv41_layer_load(19))
+        worker.wait_for_layer_load.assert_called_once()
+
+    def test_dsv41_empty_cut_publishes_only_pages_written_in_every_resource(self):
+        worker = self._make_worker()
+        worker._global_to_local_layer = {20: 0}
+        worker.current_layer = 0
+        worker._dsv41_cut_slot_sources = {1: ("long", "index")}
+        shared = SharedBlockData(np.asarray([5, 6, 7]), None, ["r"], [True], ["full", "partial", "unwritten"])
+        task = LayerTransferTask(layer_id=0, group_id=1, block_ranges=[], shared_block_data=shared)
+        worker.layer_save_tasks = [[task]]
+        worker.save_kv_layer = MagicMock()
+        worker._queue_layerwise_revoke_keys = MagicMock()
+        metadata = AscendConnectorMetadata(set())
+        long_slots = torch.tensor([[5, 0], [5, 1], [6, 0], [6, 1], [-1, -1]])
+        index_slots = torch.tensor([[5, 0], [5, 1], [6, 0], [6, 0], [7, 1], [7, 0]])
+        swa_name = "model.layers.20.self_attn.swa_cache"
+        worker.record_dsv41_cut_writes(
+            swa_name,
+            {
+                swa_name: SimpleNamespace(num_actual_tokens=5),
+                "long": SimpleNamespace(slot_mapping=long_slots, num_actual_tokens=5, storage_block_size=2),
+                "index": SimpleNamespace(slot_mapping=index_slots, num_actual_tokens=6, storage_block_size=2),
+            },
+        )
+        worker.finish_empty_dsv41_layer(20, metadata)
+        self.assertEqual(task.shared_block_data.block_ids_arr.tolist(), [5])
+        self.assertEqual(task.shared_block_data.block_keys, ["full"])
+        self.assertEqual(set(worker._queue_layerwise_revoke_keys.call_args.args[0]), {"partial", "unwritten"})
+        self.assertEqual(worker._dsv41_cache_only_blocks, {})
+        worker.save_kv_layer.assert_called_once_with(metadata)
+
+    def test_dsv41_skipped_draft_finishes_loads_and_revokes_unwritten_puts(self):
+        worker = self._make_worker()
+        worker.dsv41_backbone_end = worker.current_layer = 2
+        worker.num_layers = 3
+        worker.can_put = True
+        worker._global_to_local_layer = {0: 0, 1: 1, 2: 2}
+        worker.layer_load_tasks = [[], [], [object()]]
+        worker.wait_for_layer_load = MagicMock()
+        worker.start_dsv41_pool_attention = MagicMock()
+        task = LayerTransferTask(
+            layer_id=2,
+            group_id=1,
+            block_ranges=[],
+            shared_block_data=SharedBlockData(np.asarray([5]), None, ["r"], [True], ["draft"]),
+        )
+        worker.layer_save_tasks = [[], [], [task]]
+        worker._queue_layerwise_revoke_keys = MagicMock()
+        worker.save_kv_layer = MagicMock(side_effect=lambda _: setattr(worker, "current_layer", 3))
+
+        worker.finish_dsv41_draft_loads()
+        worker.wait_for_layer_load.assert_called_once()
+        self.assertEqual(worker.current_layer, 2)
+        self.assertTrue(worker.wait_for_dsv41_layer_load(2))
+        worker.wait_for_layer_load.assert_called_once()
+        worker.finish_dsv41_pool_step(AscendConnectorMetadata(set()))
+        worker._queue_layerwise_revoke_keys.assert_called_once_with(["draft"])
+        self.assertEqual(task.shared_block_data.block_keys, [])
+        self.assertFalse(worker.wait_for_dsv41_layer_load(2))
+
     def test_layerwise_prefetch_window_advances_with_model_layer(self):
         """load(L) is submitted at model layer max(0, L - P), for every shard.
 

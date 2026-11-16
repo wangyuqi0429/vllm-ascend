@@ -170,6 +170,31 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             if callable(hook):
                 hook(layer_name)
 
+    def on_dsv41_cache_written(self, cache_name, swa_slots, *, cache_only: bool = False) -> None:
+        # Preserve the same slot-release ordering as other cache-write hooks.
+        for connector in (*self._layerwise_slot_release_providers, *self._non_slot_release_connectors):
+            hook = getattr(connector, "on_dsv41_cache_written", None)
+            if callable(hook):
+                hook(cache_name, swa_slots, cache_only=cache_only)
+
+    def on_dsv41_pool_attention_start(self, cache_name: str, *, empty: bool = False) -> None:
+        for connector in self._connectors:
+            hook = getattr(connector, "on_dsv41_pool_attention_start", None)
+            if callable(hook):
+                hook(cache_name, empty=empty)
+
+    def on_dsv41_pool_cut_writes(self, cache_name: str, attn_metadata: dict[str, Any]) -> None:
+        for connector in self._connectors:
+            hook = getattr(connector, "on_dsv41_pool_cut_writes", None)
+            if callable(hook):
+                hook(cache_name, attn_metadata)
+
+    def on_dsv41_pool_attention_error(self) -> None:
+        for connector in self._connectors:
+            hook = getattr(connector, "on_dsv41_pool_attention_error", None)
+            if callable(hook):
+                hook()
+
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
         empty_blocks = blocks.new_empty()

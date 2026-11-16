@@ -1289,6 +1289,9 @@ class NPUWorker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate NPU KV cache with the specified kv_cache_config."""
         speculator = getattr(self.model_runner, "speculator", None)
+        draft_names = getattr(speculator, "draft_attn_layer_names", None)
+        if draft_names:
+            kv_cache_config.draft_attn_layer_names = tuple(sorted(draft_names))
         speculative = self.vllm_config.speculative_config
         if (
             speculative is not None
